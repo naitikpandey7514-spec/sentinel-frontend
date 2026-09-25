@@ -13,3 +13,6 @@ storage/videos/
 ../ffmpeg/
 ffmpeg/
 *.exe
+# Python cache
+__pycache__/
+*.py[cod]
