@@ -1,6 +1,15 @@
 from dotenv import load_dotenv
 import cv2
+import threading
+import time
+from fastapi.responses import StreamingResponse
 from pathlib import Path
+import base64
+import urllib.error
+import urllib.request
+import base64
+from urllib.parse import quote
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi import HTTPException, Query
 import uuid
 import os
@@ -240,7 +249,72 @@ def get_live_cameras():
         "count": len(cameras),
         "cameras": cameras
     }
+# -------------------------
+# INTEGRATIONS + VMS STATUS
+# -------------------------
 
+@app.get("/api/integrations")
+def get_integrations():
+    """
+    Reports available Sentinel-X components.
+    Catalogue availability does not mean camera streams are connected.
+    """
+    try:
+        cameras = load_camera_catalogue()
+        catalogue_status = "Available"
+        camera_count = len(cameras)
+    except Exception:
+        catalogue_status = "Unavailable"
+        camera_count = 0
+
+    return [
+        {
+            "id": "sentinel-backend",
+            "type": "Backend API",
+            "name": "Sentinel-X Backend",
+            "description": "FastAPI service",
+            "status": "Connected"
+        },
+        {
+            "id": "camera-catalogue",
+            "type": "Camera Catalogue",
+            "name": "Sentinel Camera Grid",
+            "description": (
+                f"Camera metadata catalogue ({camera_count} entries)"
+            ),
+            "status": catalogue_status
+        },
+        {
+            "id": "vms-gateway",
+            "type": "VMS",
+            "name": "CCTV Stream Gateway",
+            "description": "Stream connection not yet verified",
+            "status": "Not Connected"
+        }
+    ]
+
+
+@app.get("/api/vms/connections")
+def get_vms_connections():
+    """
+    No VMS stream is marked connected until a real connection
+    check has been implemented and completed.
+    """
+    return [
+        {
+            "id": "cctv-gateway",
+            "name": "CCTV Stream Gateway",
+            "server_name": "CCTV Stream Gateway",
+            "description": (
+                "Gateway configured for future authorized stream "
+                "connection. No active stream verified."
+            ),
+            "status": "Not Connected",
+            "host": None,
+            "active_streams": None,
+            "uptime": None
+        }
+    ]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -314,7 +388,78 @@ def get_camera(camera_id: int, db: Session = Depends(get_db)):
 def get_watchlist(db: Session = Depends(get_db)):
     return db.scalars(select(Watchlist).order_by(Watchlist.id.desc())).all()
 
+@app.post("/api/cctv/whep")
+async def cctv_whep(request: Request):
+    load_dotenv()
 
+    email = os.getenv("CCTV_EMAIL")
+    password = os.getenv("CCTV_PASSWORD")
+    camera_id = os.getenv("CCTV_CAMERA_ID", "cam01")
+
+    if not email or not password:
+        raise HTTPException(
+            status_code=500,
+            detail="CCTV credentials are not configured"
+        )
+
+    sdp_offer = await request.body()
+
+    if not sdp_offer:
+        raise HTTPException(
+            status_code=400,
+            detail="SDP offer is required"
+        )
+
+    encoded_email = quote(email, safe="")
+    encoded_password = quote(password, safe="")
+
+    whep_url = (
+        f"http://103.250.160.189:8889"
+        f"/stream/{camera_id}/whep"
+    )
+
+    auth = base64.b64encode(
+        f"{email}:{password}".encode()
+    ).decode()
+
+    whep_request = urllib.request.Request(
+        whep_url,
+        data=sdp_offer,
+        method="POST",
+        headers={
+            "Authorization": f"Basic {auth}",
+            "Content-Type": "application/sdp",
+            "Accept": "application/sdp",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(whep_request, timeout=15) as response:
+            answer = response.read()
+            location = response.headers.get("Location")
+
+            return Response(
+                content=answer,
+                status_code=response.status,
+                media_type="application/sdp",
+                headers={
+                    "Location": location or ""
+                },
+            )
+
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode(errors="replace")
+
+        raise HTTPException(
+            status_code=exc.code,
+            detail=f"WHEP server error: {error_body}"
+        )
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"WHEP connection failed: {str(exc)}"
+        )
 @app.post("/api/watchlist")
 def add_watchlist_item(
     payload: WatchlistIn,
@@ -629,3 +774,127 @@ def process_video(
 
     finally:
         cap.release()
+
+@app.get("/api/cctv/test")
+@app.get("/api/cctv/preview")
+def cctv_preview():
+    from urllib.parse import quote
+
+    load_dotenv()
+
+    email = os.getenv("CCTV_EMAIL")
+    password = os.getenv("CCTV_PASSWORD")
+    camera_id = os.getenv("CCTV_CAMERA_ID")
+
+    if not all([email, password, camera_id]):
+        raise HTTPException(
+            status_code=500,
+            detail="CCTV configuration is incomplete"
+        )
+
+    safe_email = quote(email, safe="")
+    safe_password = quote(password, safe="")
+
+    rtsp_url = (
+        f"rtsp://{safe_email}:{safe_password}"
+        f"@103.250.160.189:8554/stream/{camera_id}"
+    )
+
+    def generate():
+        cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+
+        if not cap.isOpened():
+            return
+
+        try:
+            while True:
+                success, frame = cap.read()
+
+                if not success or frame is None:
+                    break
+
+                success, encoded = cv2.imencode(
+                    ".jpg",
+                    frame,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), 80]
+                )
+
+                if not success:
+                    continue
+
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n\r\n"
+                    + encoded.tobytes()
+                    + b"\r\n"
+                )
+
+        finally:
+            cap.release()
+
+    return StreamingResponse(
+        generate(),
+        media_type="multipart/x-mixed-replace; boundary=frame"
+    )
+def test_cctv_connection():
+    from urllib.parse import quote
+    import cv2
+    import os
+
+    load_dotenv()
+
+    email = os.getenv("CCTV_EMAIL")
+    password = os.getenv("CCTV_PASSWORD")
+    camera_id = os.getenv("CCTV_CAMERA_ID")
+
+    if not all([email, password, camera_id]):
+        raise HTTPException(
+            status_code=500,
+            detail="CCTV configuration is incomplete"
+        )
+
+    # Encode credentials safely for the RTSP URL
+    safe_email = quote(email, safe="")
+    safe_password = quote(password, safe="")
+
+    rtsp_url = (
+        f"rtsp://{safe_email}:{safe_password}"
+        f"@103.250.160.189:8554/stream/{camera_id}"
+    )
+
+    cap = None
+
+    try:
+        cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+
+        if not cap.isOpened():
+            return {
+                "status": "not_connected",
+                "message": "Could not open CCTV stream"
+            }
+
+        success, frame = cap.read()
+
+        if not success or frame is None:
+            return {
+                "status": "no_video",
+                "message": "Stream opened but no frame received"
+            }
+
+        return {
+            "status": "connected",
+            "message": "CCTV stream returned a video frame",
+            "camera_id": camera_id,
+            "frame_width": int(frame.shape[1]),
+            "frame_height": int(frame.shape[0])
+        }
+
+    except Exception:
+        return {
+            "status": "error",
+            "message": "CCTV connection test failed"
+        }
+
+    finally:
+        if cap is not None:
+            cap.release()
