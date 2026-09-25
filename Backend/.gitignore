@@ -1,3 +1,5 @@
 .env
 .env.local
 .env.*.local
+Backend/storage/
+Backend/storage/videos/
