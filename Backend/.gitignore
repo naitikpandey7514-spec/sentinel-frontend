@@ -3,3 +3,4 @@
 .env.*.local
 Backend/storage/
 Backend/storage/videos/
+Backend/ffmpeg/
