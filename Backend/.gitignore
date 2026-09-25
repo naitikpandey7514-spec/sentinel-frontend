@@ -1,7 +1,15 @@
+# Environment Files
 .env
 .env.local
 .env.*.local
-Backend/storage/
-Backend/storage/videos/
-Backend/ffmpeg/
-Backend/ffmpeg/ffmpeg-9.0.2-essentials_build/
+
+# Storage & Uploaded Media (relative to Backend/)
+storage/
+storage/videos/
+*.mp4
+*.mjpeg
+
+# FFmpeg Executables & Directories
+../ffmpeg/
+ffmpeg/
+*.exe
