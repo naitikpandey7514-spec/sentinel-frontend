@@ -3,18 +3,14 @@ import {
   Search,
   RefreshCw,
   Camera,
-  Wifi,
   WifiOff,
-  Eye,
 } from "lucide-react";
-import { useNavigate } from "react-router-dom";
 
 import api from "../services/api";
 import { normalizeCameras } from "../data/mockData";
+import CameraCard from "../components/cameras/CameraCard";
 
 function Cameras() {
-  const navigate = useNavigate();
-
   const [cameras, setCameras] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -26,17 +22,18 @@ function Cameras() {
     setError("");
 
     try {
-     const response = await api.get("/api/live-cameras");
+      const response = await api.get(
+        "/api/live-cameras"
+      );
 
-  const data = Array.isArray(response.data)
-    ? response.data
-    : response.data.cameras || [];
+      const data = Array.isArray(response.data)
+        ? response.data
+        : response.data?.cameras || [];
 
-setCameras(normalizeCameras(data));
-
-      setCameras(data);
+      setCameras(normalizeCameras(data));
     } catch (err) {
       console.error("Camera API error:", err);
+
       setCameras([]);
       setError(
         "Unable to connect to the CCTV backend."
@@ -59,11 +56,13 @@ setCameras(normalizeCameras(data));
         ${camera.type || ""}
       `.toLowerCase();
 
-      const matchesSearch =
-        text.includes(search.toLowerCase());
+      const matchesSearch = text.includes(
+        search.toLowerCase()
+      );
 
-      const cameraStatus =
-        String(camera.status || "Unknown").toLowerCase();
+      const cameraStatus = String(
+        camera.status || "Unknown"
+      ).toLowerCase();
 
       const matchesStatus =
         status === "All" ||
@@ -79,11 +78,12 @@ setCameras(normalizeCameras(data));
         <div>
           <div className="title-row">
             <Camera size={24} />
+
             <h2>Camera Registry</h2>
           </div>
 
           <p>
-            Manage and monitor connected Sentinel CCTV cameras.
+            Monitor the Sentinel CCTV camera network.
           </p>
         </div>
 
@@ -96,6 +96,7 @@ setCameras(normalizeCameras(data));
             size={17}
             className={loading ? "spin" : ""}
           />
+
           Refresh
         </button>
       </div>
@@ -108,24 +109,28 @@ setCameras(normalizeCameras(data));
             type="text"
             placeholder="Search camera, ID or location..."
             value={search}
-            onChange={(e) => setSearch(e.target.value)}
+            onChange={(event) =>
+              setSearch(event.target.value)
+            }
           />
         </div>
 
         <div className="filter-buttons">
-          {["All", "Online", "Offline"].map((item) => (
-            <button
-              key={item}
-              className={
-                status === item
-                  ? "filter-button active"
-                  : "filter-button"
-              }
-              onClick={() => setStatus(item)}
-            >
-              {item}
-            </button>
-          ))}
+          {["All", "Online", "Offline"].map(
+            (item) => (
+              <button
+                key={item}
+                className={
+                  status === item
+                    ? "filter-button active"
+                    : "filter-button"
+                }
+                onClick={() => setStatus(item)}
+              >
+                {item}
+              </button>
+            )
+          )}
         </div>
       </div>
 
@@ -134,7 +139,10 @@ setCameras(normalizeCameras(data));
           <WifiOff size={22} />
 
           <div>
-            <strong>Camera Backend Unavailable</strong>
+            <strong>
+              Camera Backend Unavailable
+            </strong>
+
             <span>{error}</span>
           </div>
         </div>
@@ -142,7 +150,11 @@ setCameras(normalizeCameras(data));
 
       {loading ? (
         <div className="loading-screen">
-          <RefreshCw className="spin" size={28} />
+          <RefreshCw
+            className="spin"
+            size={28}
+          />
+
           <p>Loading CCTV cameras...</p>
         </div>
       ) : filteredCameras.length === 0 ? (
@@ -158,98 +170,13 @@ setCameras(normalizeCameras(data));
           </p>
         </div>
       ) : (
-        <div className="camera-table-wrapper">
-          <table className="camera-table">
-            <thead>
-              <tr>
-                <th>Camera</th>
-                <th>Location</th>
-                <th>Type</th>
-                <th>Status</th>
-                <th>Resolution</th>
-                <th>FPS</th>
-                <th>Action</th>
-              </tr>
-            </thead>
-
-            <tbody>
-              {filteredCameras.map((camera) => {
-                const isOnline =
-                  String(camera.status).toLowerCase() ===
-                  "online";
-
-                return (
-                  <tr key={camera.id}>
-                    <td>
-                      <div className="camera-name">
-                        <div className="camera-icon">
-                          <Camera size={18} />
-                        </div>
-
-                        <div>
-                          <strong>
-                            {camera.name || camera.id}
-                          </strong>
-
-                          <span>
-                            {camera.id}
-                          </span>
-                        </div>
-                      </div>
-                    </td>
-
-                    <td>
-                      {camera.location || "—"}
-                    </td>
-
-                    <td>
-                      {camera.type || "CCTV"}
-                    </td>
-
-                    <td>
-                      <span
-                        className={
-                          isOnline
-                            ? "status-badge online"
-                            : "status-badge offline"
-                        }
-                      >
-                        {isOnline ? (
-                          <Wifi size={14} />
-                        ) : (
-                          <WifiOff size={14} />
-                        )}
-
-                        {camera.status || "Unknown"}
-                      </span>
-                    </td>
-
-                    <td>
-                      {camera.resolution || "—"}
-                    </td>
-
-                    <td>
-                      {camera.fps ?? "—"}
-                    </td>
-
-                    <td>
-                      <button
-                        className="view-button"
-                        onClick={() =>
-                          navigate(
-                            `/cameras/${camera.id}`
-                          )
-                        }
-                      >
-                        <Eye size={16} />
-                        View
-                      </button>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
+        <div className="camera-grid">
+          {filteredCameras.map((camera) => (
+            <CameraCard
+              key={camera.id}
+              camera={camera}
+            />
+          ))}
         </div>
       )}
 
@@ -261,7 +188,7 @@ setCameras(normalizeCameras(data));
           </span>
 
           <span>
-            <span className="online-dot"></span>
+            <span className="online-dot" />
             Live registry
           </span>
         </div>

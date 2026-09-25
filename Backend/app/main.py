@@ -15,6 +15,8 @@ import uuid
 import os
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
+
+import httpx
 from app.services.vehicle_detector import detect_vehicles
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -460,6 +462,79 @@ async def cctv_whep(request: Request):
             status_code=502,
             detail=f"WHEP connection failed: {str(exc)}"
         )
+@app.post("/api/cctv/whep/{camera_id}")
+async def cctv_whep_camera(
+    camera_id: str,
+    request: Request,
+):
+    load_dotenv()
+
+    email = os.getenv("CCTV_EMAIL")
+    password = os.getenv("CCTV_PASSWORD")
+
+    if not email or not password:
+        raise HTTPException(
+            status_code=500,
+            detail="CCTV credentials are not configured.",
+        )
+
+    camera_id = camera_id.strip()
+
+    if not camera_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Camera ID is required.",
+        )
+
+    whep_url = (
+        f"http://103.250.160.189:8889/"
+        f"stream/{camera_id}/whep"
+    )
+
+    offer_sdp = await request.body()
+
+    if not offer_sdp:
+        raise HTTPException(
+            status_code=400,
+            detail="WebRTC SDP offer is required.",
+        )
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(15.0)
+        ) as client:
+            response = await client.post(
+                whep_url,
+                content=offer_sdp,
+                headers={
+                    "Content-Type": "application/sdp",
+                    "Accept": "application/sdp",
+                },
+                auth=(email, password),
+            )
+
+        if response.status_code >= 400:
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=(
+                    f"WHEP upstream returned "
+                    f"HTTP {response.status_code}: "
+                    f"{response.text[:500]}"
+                ),
+            )
+
+        return Response(
+            content=response.content,
+            status_code=response.status_code,
+            media_type="application/sdp",
+        )
+
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"WHEP upstream connection failed: {exc}",
+        )
+
 @app.post("/api/watchlist")
 def add_watchlist_item(
     payload: WatchlistIn,

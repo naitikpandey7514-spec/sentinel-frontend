@@ -19,181 +19,291 @@ function CameraDetails() {
   const navigate = useNavigate();
   const { cameraId } = useParams();
 
+  const videoRef = useRef(null);
+
   const [camera, setCamera] = useState(null);
   const [events, setEvents] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  const videoRef = useRef(null);
 
   async function loadCamera() {
-  setLoading(true);
-  setError("");
+    setLoading(true);
+    setError("");
 
-  try {
-    const [cameraResponse, alertsResponse] =
-      await Promise.all([
+    try {
+      const [cameraResponse, alertsResponse] = await Promise.all([
         api.get("/api/live-cameras"),
         api.get("/api/alerts"),
       ]);
 
-    const cameras = Array.isArray(cameraResponse.data)
-      ? cameraResponse.data
-      : cameraResponse.data.cameras || [];
+      const cameras = Array.isArray(cameraResponse.data)
+        ? cameraResponse.data
+        : cameraResponse.data.cameras || [];
 
-    const selectedCamera = cameras.find(
-      (item) =>
-        String(item.id).toLowerCase() ===
-        String(cameraId).toLowerCase()
-    );
+      const selectedCamera = cameras.find(
+        (item) =>
+          String(item.id).toLowerCase() ===
+          String(cameraId).toLowerCase()
+      );
 
-    if (!selectedCamera) {
-      throw new Error("Camera not found");
+      if (!selectedCamera) {
+        throw new Error("Camera not found");
+      }
+
+      setCamera(selectedCamera);
+
+      const alerts = Array.isArray(alertsResponse.data)
+        ? alertsResponse.data
+        : alertsResponse.data.value ||
+          alertsResponse.data.alerts ||
+          [];
+
+      const cameraAlerts = alerts
+        .filter(
+          (alert) =>
+            String(alert.camera_id) ===
+            String(selectedCamera.id)
+        )
+        .map((alert) => ({
+          ...alert,
+          type: alert.alert_type || "Security Alert",
+          severity: String(
+            alert.priority || "Normal"
+          ).toLowerCase(),
+          description: `${
+            alert.plate_number || "Unknown vehicle"
+          } — ${
+            alert.alert_type || "Security Alert"
+          } (${alert.status || "Unknown status"})`,
+          time: alert.timestamp,
+        }));
+
+      setEvents(cameraAlerts);
+    } catch (err) {
+      console.error("Camera details error:", err);
+
+      setCamera(null);
+      setEvents([]);
+
+      setError(
+        "Unable to load this camera from the Sentinel-X backend."
+      );
+    } finally {
+      setLoading(false);
     }
-
-    setCamera(selectedCamera);
-
-    const alerts = Array.isArray(alertsResponse.data)
-      ? alertsResponse.data
-      : alertsResponse.data.value ||
-        alertsResponse.data.alerts ||
-        [];
-
-    const cameraAlerts = alerts
-      .filter(
-        (alert) =>
-          String(alert.camera_id) ===
-          String(selectedCamera.id)
-      )
-      .map((alert) => ({
-        ...alert,
-        type: alert.alert_type || "Security Alert",
-        severity: String(
-          alert.priority || "Normal"
-        ).toLowerCase(),
-        description: `${alert.plate_number || "Unknown vehicle"} — ${alert.alert_type || "Security Alert"} (${alert.status || "Unknown status"})`,
-        time: alert.timestamp,
-      }));
-
-    setEvents(cameraAlerts);
-  } catch (err) {
-    console.error("Camera details error:", err);
-
-    setCamera(null);
-    setEvents([]);
-    setError(
-      "Unable to load this camera from the Sentinel-X backend."
-    );
-  } finally {
-    setLoading(false);
   }
-}
 
   useEffect(() => {
     loadCamera();
   }, [cameraId]);
+
+  /*
+   * WebRTC / WHEP live camera connection
+   *
+   * Browser
+   *    ↓
+   * POST SDP offer
+   *    ↓
+   * Sentinel-X backend
+   *    ↓
+   * WHEP
+   *    ↓
+   * CCTV gateway
+   */
   useEffect(() => {
-  if (cameraId !== "cam01") {
-    return;
+    if (!cameraId) {
+      return;
+    }
+
+    let peerConnection = null;
+    let stopped = false;
+
+    async function startWhep() {
+      try {
+        console.log(
+          `Starting WHEP connection for ${cameraId}`
+        );
+
+        peerConnection = new RTCPeerConnection();
+
+        peerConnection.addTransceiver("video", {
+          direction: "recvonly",
+        });
+
+        peerConnection.ontrack = (event) => {
+  console.log("WHEP TRACK RECEIVED:", event);
+
+  if (event.track) {
+    console.log(
+      "WHEP TRACK:",
+      event.track.kind,
+      event.track.readyState
+    );
   }
 
-  let peerConnection;
-  let stopped = false;
+  if (videoRef.current) {
+    const stream =
+      event.streams?.[0] ||
+      new MediaStream([event.track]);
 
-  async function startWhep() {
-    try {
-      peerConnection = new RTCPeerConnection();
+    videoRef.current.srcObject = stream;
 
-      peerConnection.addTransceiver("video", {
-        direction: "recvonly",
+    videoRef.current
+      .play()
+      .then(() => {
+        console.log("WHEP VIDEO PLAYING");
+      })
+      .catch((err) => {
+        console.error(
+          "WHEP VIDEO PLAY ERROR:",
+          err
+        );
       });
+  }
+};
 
-      peerConnection.ontrack = (event) => {
-        if (videoRef.current && event.streams[0]) {
-          videoRef.current.srcObject = event.streams[0];
-        }
-      };
+        peerConnection.onconnectionstatechange = () => {
+          console.log(
+            `WHEP connection state for ${cameraId}:`,
+            peerConnection?.connectionState
+          );
+        };
 
-      const offer = await peerConnection.createOffer();
-      await peerConnection.setLocalDescription(offer);
+        peerConnection.oniceconnectionstatechange =
+          () => {
+            console.log(
+              `WHEP ICE state for ${cameraId}:`,
+              peerConnection?.iceConnectionState
+            );
+          };
 
-      await new Promise((resolve) => {
-        if (peerConnection.iceGatheringState === "complete") {
-          resolve();
+        const offer =
+          await peerConnection.createOffer();
+
+        await peerConnection.setLocalDescription(
+          offer
+        );
+
+        /*
+         * Wait until ICE gathering is complete.
+         *
+         * This makes sure the SDP sent to the backend
+         * contains the ICE candidates needed by the
+         * WHEP server.
+         */
+        await new Promise((resolve) => {
+          if (
+            peerConnection.iceGatheringState ===
+            "complete"
+          ) {
+            resolve();
+            return;
+          }
+
+          const checkIce = () => {
+            if (
+              peerConnection.iceGatheringState ===
+              "complete"
+            ) {
+              peerConnection.removeEventListener(
+                "icegatheringstatechange",
+                checkIce
+              );
+
+              resolve();
+            }
+          };
+
+          peerConnection.addEventListener(
+            "icegatheringstatechange",
+            checkIce
+          );
+        });
+
+        if (stopped) {
           return;
         }
 
-        const checkIce = () => {
-          if (peerConnection.iceGatheringState === "complete") {
-            peerConnection.removeEventListener(
-              "icegatheringstatechange",
-              checkIce
-            );
-            resolve();
-          }
-        };
+        const baseUrl =
+          api.defaults.baseURL || "";
 
-        peerConnection.addEventListener(
-          "icegatheringstatechange",
-          checkIce
+        const whepUrl =
+          `${baseUrl}/api/cctv/whep/` +
+          encodeURIComponent(cameraId);
+
+        console.log(
+          `Sending WHEP offer to ${whepUrl}`
         );
-      });
 
-      if (stopped) {
-        return;
-      }
-
-      const response = await fetch(
-        `${api.defaults.baseURL}/api/cctv/whep`,
-        {
+        const response = await fetch(whepUrl, {
           method: "POST",
           headers: {
             "Content-Type": "application/sdp",
             Accept: "application/sdp",
           },
-          body: peerConnection.localDescription.sdp,
-        }
-      );
+          body:
+            peerConnection.localDescription.sdp,
+        });
 
-      if (!response.ok) {
-        throw new Error(
-          `WHEP signaling failed: ${response.status}`
+        if (!response.ok) {
+          const message =
+            await response.text();
+
+          throw new Error(
+            `WHEP signaling failed: ${response.status} ${message}`
+          );
+        }
+
+        const answerSdp =
+          await response.text();
+
+        if (stopped) {
+          return;
+        }
+
+        await peerConnection.setRemoteDescription(
+          {
+            type: "answer",
+            sdp: answerSdp,
+          }
+        );
+
+        console.log(
+          `WHEP connection established for ${cameraId}`
+        );
+      } catch (err) {
+        console.error(
+          `WHEP connection error for ${cameraId}:`,
+          err
         );
       }
+    }
 
-      const answerSdp = await response.text();
+    startWhep();
 
-      if (stopped) {
-        return;
+    return () => {
+      stopped = true;
+
+      if (peerConnection) {
+        peerConnection.close();
+        peerConnection = null;
       }
 
-      await peerConnection.setRemoteDescription({
-        type: "answer",
-        sdp: answerSdp,
-      });
-    } catch (err) {
-      console.error("WHEP connection error:", err);
-    }
-  }
+      if (videoRef.current) {
+        videoRef.current.srcObject = null;
+      }
+    };
+  }, [cameraId]);
 
-  startWhep();
-
-  return () => {
-    stopped = true;
-
-    if (peerConnection) {
-      peerConnection.close();
-    }
-
-    if (videoRef.current) {
-      videoRef.current.srcObject = null;
-    }
-  };
-}, [cameraId]);
   if (loading) {
     return (
       <div className="page">
         <div className="loading-screen">
-          <RefreshCw className="spin" size={28} />
+          <RefreshCw
+            className="spin"
+            size={28}
+          />
+
           <p>Loading camera...</p>
         </div>
       </div>
@@ -216,6 +326,7 @@ function CameraDetails() {
 
           <div>
             <h3>Camera Unavailable</h3>
+
             <p>
               {error ||
                 "The requested camera could not be found."}
@@ -235,13 +346,8 @@ function CameraDetails() {
   }
 
   const isOnline =
-    String(camera.status || "").toLowerCase() === "online";
-
-  const streamUrl =
-    camera.hls_url ||
-    camera.hls ||
-    camera.stream_url ||
-    "";
+    String(camera.status || "").toLowerCase() ===
+    "online";
 
   return (
     <div className="page camera-details-page">
@@ -261,10 +367,13 @@ function CameraDetails() {
             </div>
 
             <div>
-              <h2>{camera.name || camera.id}</h2>
+              <h2>
+                {camera.name || camera.id}
+              </h2>
 
               <p>
                 {camera.id}
+
                 {camera.location
                   ? ` • ${camera.location}`
                   : ""}
@@ -310,33 +419,24 @@ function CameraDetails() {
           </div>
 
           <div className="camera-stream">
-  {cameraId === "cam01" ? (
-    <video
-      ref={videoRef}
-      autoPlay
-      muted
-      playsInline
-      className="camera-live-feed"
-    />
-  ) : (
-    <div className="stream-placeholder">
-      <Camera size={48} />
-
-      <strong>Camera Offline</strong>
-
-      <span>
-        This camera is currently offline.
-      </span>
-    </div>
-  )}
-</div>
+            <video
+              ref={videoRef}
+              autoPlay
+              muted
+              playsInline
+              className="camera-live-feed"
+            />
+          </div>
         </section>
 
         <section className="camera-health-panel">
           <div className="panel-header">
             <div>
               <h3>Camera Health</h3>
-              <p>Current camera information</p>
+
+              <p>
+                Current camera information
+              </p>
             </div>
 
             {isOnline ? (
@@ -367,13 +467,19 @@ function CameraDetails() {
           <div className="health-grid">
             <div className="health-item">
               <Signal size={18} />
+
               <span>FPS</span>
-              <strong>{camera.fps ?? "—"}</strong>
+
+              <strong>
+                {camera.fps ?? "—"}
+              </strong>
             </div>
 
             <div className="health-item">
               <Camera size={18} />
+
               <span>Resolution</span>
+
               <strong>
                 {camera.resolution || "—"}
               </strong>
@@ -381,7 +487,9 @@ function CameraDetails() {
 
             <div className="health-item">
               <Clock3 size={18} />
+
               <span>Uptime</span>
+
               <strong>
                 {camera.uptime || "—"}
               </strong>
@@ -389,7 +497,9 @@ function CameraDetails() {
 
             <div className="health-item">
               <Cpu size={18} />
+
               <span>Detection</span>
+
               <strong>
                 {camera.detection || "—"}
               </strong>
@@ -401,11 +511,15 @@ function CameraDetails() {
 
             <div>
               <span>Camera ID</span>
-              <strong>{camera.id}</strong>
+
+              <strong>
+                {camera.id}
+              </strong>
             </div>
 
             <div>
               <span>Location</span>
+
               <strong>
                 {camera.location || "—"}
               </strong>
@@ -413,6 +527,7 @@ function CameraDetails() {
 
             <div>
               <span>Type</span>
+
               <strong>
                 {camera.type || "CCTV"}
               </strong>
@@ -425,8 +540,10 @@ function CameraDetails() {
         <div className="panel-header">
           <div>
             <h3>Recent Events</h3>
+
             <p>
-              Latest events from {camera.name || camera.id}
+              Latest events from{" "}
+              {camera.name || camera.id}
             </p>
           </div>
 
@@ -442,13 +559,16 @@ function CameraDetails() {
             {events.map((event, index) => (
               <div
                 className="event-row"
-                key={event.id || index}
+                key={
+                  event.id || index
+                }
               >
                 <div className="event-indicator"></div>
 
                 <div className="event-info">
                   <strong>
-                    {event.type || "Camera Event"}
+                    {event.type ||
+                      "Camera Event"}
                   </strong>
 
                   <span>
@@ -460,7 +580,8 @@ function CameraDetails() {
 
                 <div className="event-meta">
                   <span className="severity">
-                    {event.severity || "Normal"}
+                    {event.severity ||
+                      "Normal"}
                   </span>
 
                   <time>
