@@ -1,19 +1,27 @@
 import { useEffect, useRef, useState } from "react";
 import {
+  Activity,
   ArrowLeft,
   Camera,
+  CheckCircle2,
   CircleAlert,
   Clock3,
   Cpu,
   Maximize,
   RefreshCw,
+  ScanLine,
   Signal,
+  Timer,
+  Users,
+  Video,
   Wifi,
   WifiOff,
 } from "lucide-react";
 import { useNavigate, useParams } from "react-router-dom";
 
 import api from "../services/api";
+import "../style/CameraDetails-ui.css";
+import LocalRecordingPanel from "../components/LocalRecordingPanel";
 
 function CameraDetails() {
   const navigate = useNavigate();
@@ -34,6 +42,9 @@ function CameraDetails() {
   const [events, setEvents] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [connectionState, setConnectionState] = useState("connecting");
+  const [streamLive, setStreamLive] = useState(false);
+  const [lastDetectionAt, setLastDetectionAt] = useState(null);
 
   async function loadCamera() {
     setLoading(true);
@@ -81,7 +92,7 @@ function CameraDetails() {
           ).toLowerCase(),
           description: `${
             alert.plate_number || "Unknown vehicle"
-          } — ${
+          }                                                                                                                                                                                                                                                                                                                                                                                                                         ${
             alert.alert_type || "Security Alert"
           } (${alert.status || "Unknown status"})`,
           time: alert.timestamp,
@@ -110,13 +121,13 @@ function CameraDetails() {
    * WebRTC / WHEP live camera connection
    *
    * Browser
-   *    ↓
+   *
    * POST SDP offer
-   *    ↓
+   *
    * Sentinel-X backend
-   *    ↓
+   *
    * WHEP
-   *    ↓
+   *
    * CCTV gateway
    */
   useEffect(() => {
@@ -661,11 +672,120 @@ useEffect(() => {
     );
   }
 
-  const isOnline =
+  const registryOnline =
     String(camera.status || "").toLowerCase() ===
     "online";
 
-  return (
+  const streamConnected = [
+    "connected",
+    "completed",
+  ].includes(
+    String(connectionState || "").toLowerCase()
+  );
+
+  const isOnline =
+    registryOnline ||
+    streamConnected ||
+    streamLive;
+
+
+  const trackedCount = detections.filter(
+    (item) =>
+      item.track_id !== null &&
+      item.track_id !== undefined
+  ).length;
+
+  const detectionCounts = detections.reduce(
+    (counts, detection) => {
+      const type = String(
+        detection.vehicle_type || "object"
+      ).toLowerCase();
+
+      counts[type] = (counts[type] || 0) + 1;
+      return counts;
+    },
+    {}
+  );
+
+  const activeDetectionTypes = Object.entries(
+    detectionCounts
+  ).sort((a, b) => b[1] - a[1]);
+
+  const detectionAgeSeconds =
+    lastDetectionAt
+      ? Math.max(
+          0,
+          (Date.now() - lastDetectionAt) / 1000
+        )
+      : null;
+
+  const detectionMeta = {
+    frame_width: detectionFrame.width,
+    frame_height: detectionFrame.height,
+    stale:
+      detectionAgeSeconds !== null &&
+      detectionAgeSeconds > 3,
+    age_seconds: detectionAgeSeconds,
+    timestamp:
+      lastDetectionAt
+        ? lastDetectionAt / 1000
+        : null,
+  };
+
+  const detectionState = detectionMeta.stale
+    ? "Stale"
+    : detections.length > 0
+      ? "Active"
+      : "Waiting";
+
+  const detectionStateTone =
+    detectionMeta?.stale
+      ? "warning"
+      : detections.length > 0
+        ? "success"
+        : "default";
+
+  const formatAge = (seconds) => {
+    const value = Number(seconds);
+
+    if (!Number.isFinite(value)) {
+      return "                                                                                  ";
+    }
+
+    if (value < 1) {
+      return `${Math.round(value * 1000)} ms`;
+    }
+
+    if (value < 60) {
+      return `${value.toFixed(1)} s`;
+    }
+
+    return `${Math.floor(value / 60)}m ${Math.floor(value % 60)}s`;
+  };
+
+  const formatTimestamp = (value) => {
+    if (!value) {
+      return "                                                                                  ";
+    }
+
+    const numeric = Number(value);
+
+    if (!Number.isFinite(numeric)) {
+      return String(value);
+    }
+
+    const date = new Date(numeric * 1000);
+
+    if (Number.isNaN(date.getTime())) {
+      return "                                                                                  ";
+    }
+
+    return date.toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+  };return (
     <div className="page camera-details-page">
       <div className="page-header">
         <div>
@@ -691,7 +811,7 @@ useEffect(() => {
                 {camera.id}
 
                 {camera.location
-                  ? ` • ${camera.location}`
+                  ? `                                                                                                                                                                                                                                                                                                                                                               ${camera.location}`
                   : ""}
               </p>
             </div>
@@ -743,6 +863,10 @@ useEffect(() => {
   autoPlay
   muted
   playsInline
+  onPlaying={() => setStreamLive(true)}
+  onWaiting={() => setStreamLive(false)}
+  onStalled={() => setStreamLive(false)}
+  onError={() => setStreamLive(false)}
   className="camera-live-feed"
   style={{
     position: "relative",
@@ -764,112 +888,238 @@ useEffect(() => {
     display: "block",
   }}
 />
-</div>
-        </section>
 
-        <section className="camera-health-panel">
-          <div className="panel-header">
+          <LocalRecordingPanel
+            videoRef={videoRef}
+            cameraId={cameraId}
+          />
+        </div>
+        </section>
+        <section className="camera-health-panel-modern">
+          <div className="camera-health-top">
             <div>
-              <h3>Camera Health</h3>
+              <div className="camera-health-eyebrow">
+                <Activity size={15} />
+                Camera Health
+              </div>
+
+              <h3>
+                {camera.name || camera.id}
+              </h3>
 
               <p>
-                Current camera information
+                Live stream and AI telemetry
               </p>
             </div>
 
-            {isOnline ? (
-              <Wifi size={20} />
-            ) : (
-              <WifiOff size={20} />
-            )}
-          </div>
-
-          <div className="health-status">
-            <span
+            <div
               className={
                 isOnline
-                  ? "status-badge online"
-                  : "status-badge offline"
+                  ? "camera-health-status success"
+                  : "camera-health-status danger"
               }
             >
               {isOnline ? (
-                <Wifi size={14} />
+                <CheckCircle2 size={16} />
               ) : (
-                <WifiOff size={14} />
+                <CircleAlert size={16} />
               )}
 
-              {camera.status || "Unknown"}
+              {isOnline ? "Online" : "Offline"}
+            </div>
+          </div>
+
+          <div className="camera-health-grid">
+            <div className="camera-metric">
+              <div className="camera-metric-icon">
+                <Signal size={17} />
+              </div>
+
+              <div>
+                <span>Frame rate</span>
+                <strong>
+                  {camera.fps ?? "                                      "}
+                </strong>
+              </div>
+            </div>
+
+            <div className="camera-metric">
+              <div className="camera-metric-icon">
+                <Video size={17} />
+              </div>
+
+              <div>
+                <span>Resolution</span>
+                <strong>
+                  {detectionMeta?.frame_width &&
+                  detectionMeta?.frame_height
+                    ? `${detectionMeta.frame_width}                             ${detectionMeta.frame_height}`
+                    : "                                      "}
+                </strong>
+              </div>
+            </div>
+
+            <div className="camera-metric">
+              <div className="camera-metric-icon">
+                <ScanLine size={17} />
+              </div>
+
+              <div>
+                <span>AI detection</span>
+                <strong
+                  className={`camera-metric-state ${detectionStateTone}`}
+                >
+                  {detectionState}
+                </strong>
+              </div>
+            </div>
+
+            <div className="camera-metric">
+              <div className="camera-metric-icon">
+                <Users size={17} />
+              </div>
+
+              <div>
+                <span>Objects in frame</span>
+                <strong>
+                  {detections.length}
+                </strong>
+              </div>
+            </div>
+
+            <div className="camera-metric">
+              <div className="camera-metric-icon">
+                <Activity size={17} />
+              </div>
+
+              <div>
+                <span>Tracked objects</span>
+                <strong>
+                  {trackedCount}
+                </strong>
+              </div>
+            </div>
+
+            <div className="camera-metric">
+              <div className="camera-metric-icon">
+                <Timer size={17} />
+              </div>
+
+              <div>
+                <span>AI age</span>
+                <strong>
+                  {formatAge(
+                    detectionMeta?.age_seconds ??
+                    detectionMeta?.age
+                  )}
+                </strong>
+              </div>
+            </div>
+          </div>
+
+          <div className="camera-health-section">
+            <div className="camera-health-section-title">
+              <div>
+                <h4>AI Detection Summary</h4>
+                <p>Objects currently reported by the detector</p>
+              </div>
+
+              <span className="camera-summary-count">
+                {detections.length}
+              </span>
+            </div>
+
+            <div className="detection-class-list">
+              {activeDetectionTypes.length > 0 ? (
+                activeDetectionTypes.map(
+                  ([type, count]) => (
+                    <div
+                      key={type}
+                      className="detection-class-chip"
+                    >
+                      <span>
+                        {type}
+                      </span>
+
+                      <strong>
+                        {count}
+                      </strong>
+                    </div>
+                  )
+                )
+              ) : (
+                <div className="camera-empty-state">
+                  No objects detected in the latest frame.
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="camera-health-section">
+            <div className="camera-health-section-title">
+              <div>
+                <h4>Connection Details</h4>
+                <p>Current stream configuration</p>
+              </div>
+            </div>
+
+            <div className="camera-detail-list">
+              <div>
+                <span>Camera ID</span>
+                <strong>
+                  {camera.id || "                                      "}
+                </strong>
+              </div>
+
+              <div>
+                <span>Location</span>
+                <strong>
+                  {camera.location || "Not specified"}
+                </strong>
+              </div>
+
+              <div>
+                <span>Type</span>
+                <strong>
+                  {camera.type || "CCTV Camera"}
+                </strong>
+              </div>
+
+              <div>
+                <span>Stream</span>
+                <strong>
+                  WHEP / WebRTC
+                </strong>
+              </div>
+
+              <div>
+                <span>Codec</span>
+                <strong>
+                  {camera.codec || "H.264"}
+                </strong>
+              </div>
+
+              <div>
+                <span>Uptime</span>
+                <strong>
+                  {camera.uptime || "                                      "}
+                </strong>
+              </div>
+            </div>
+          </div>
+
+          <div className="camera-health-footer">
+            <Clock3 size={14} />
+
+            <span>
+              Last AI update
             </span>
-          </div>
 
-          <div className="health-grid">
-            <div className="health-item">
-              <Signal size={18} />
-
-              <span>FPS</span>
-
-              <strong>
-                {camera.fps ?? "—"}
-              </strong>
-            </div>
-
-            <div className="health-item">
-              <Camera size={18} />
-
-              <span>Resolution</span>
-
-              <strong>
-                {camera.resolution || "—"}
-              </strong>
-            </div>
-
-            <div className="health-item">
-              <Clock3 size={18} />
-
-              <span>Uptime</span>
-
-              <strong>
-                {camera.uptime || "—"}
-              </strong>
-            </div>
-
-            <div className="health-item">
-              <Cpu size={18} />
-
-              <span>Detection</span>
-
-              <strong>
-                {camera.detection || "—"}
-              </strong>
-            </div>
-          </div>
-
-          <div className="camera-information">
-            <h4>Camera Information</h4>
-
-            <div>
-              <span>Camera ID</span>
-
-              <strong>
-                {camera.id}
-              </strong>
-            </div>
-
-            <div>
-              <span>Location</span>
-
-              <strong>
-                {camera.location || "—"}
-              </strong>
-            </div>
-
-            <div>
-              <span>Type</span>
-
-              <strong>
-                {camera.type || "CCTV"}
-              </strong>
-            </div>
+            <strong>
+              {formatTimestamp(
+                detectionMeta?.timestamp
+              )}
+            </strong>
           </div>
         </section>
       </div>
@@ -925,7 +1175,7 @@ useEffect(() => {
                   <time>
                     {event.time ||
                       event.timestamp ||
-                      "—"}
+                      "                                                                                                                                                                                                                                                                                                                                                                                                                       "}
                   </time>
                 </div>
               </div>

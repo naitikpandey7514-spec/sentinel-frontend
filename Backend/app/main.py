@@ -884,7 +884,7 @@ def create_user(
         .lower()
     )
 
-    full_name = payload.full_name.strip()
+    full_name = payload.name.strip()
 
     role_name = (
         payload.role
@@ -942,7 +942,7 @@ def create_user(
     user = User(
     username=payload.username.strip(),
     email=payload.email.strip().lower(),
-    name=payload.name.strip(),
+    full_name=full_name,
     password_hash=hash_password(payload.password),
     role_id=role.id,
     is_active=True,
