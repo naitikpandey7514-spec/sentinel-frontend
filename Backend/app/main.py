@@ -7,6 +7,7 @@ from pathlib import Path
 import base64
 import urllib.error
 import urllib.request
+import http.cookiejar
 import base64
 from urllib.parse import quote
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -225,32 +226,289 @@ app = FastAPI(
 )
 
 # Sentinel Camera Grid catalogue
-CATALOGUE_PATH = Path(__file__).resolve().parent.parent / "cameras.json"
+CATALOGUE_URL = "https://cctv.corp8.cloud/cameras.json"
+
+CATALOGUE_URL = "https://cctv.corp8.cloud/cameras.json"
+
+
+import http.cookiejar
+import urllib.parse
+import urllib.request
+import json
+import os
+
+
+CATALOGUE_URL = "https://cctv.corp8.cloud/cameras.json"
+LOGIN_URL = "https://cctv.corp8.cloud/auth/login"
+
+_catalogue_cache = []
+_catalogue_cache_time = 0.0
+CATALOGUE_CACHE_SECONDS = 60
 
 
 def load_camera_catalogue():
-    if not CATALOGUE_PATH.exists():
-        raise FileNotFoundError(
-            f"Camera catalogue not found: {CATALOGUE_PATH}"
+    global _catalogue_cache
+    global _catalogue_cache_time
+
+    # ---------------------------------------------------------
+    # Use cached catalogue for 60 seconds
+    # ---------------------------------------------------------
+
+    now = time.time()
+
+    if (
+        _catalogue_cache
+        and now - _catalogue_cache_time
+        < CATALOGUE_CACHE_SECONDS
+    ):
+        return _catalogue_cache
+
+    email = os.getenv("CCTV_GRID_EMAIL")
+    password = os.getenv("CCTV_GRID_PASSWORD")
+
+    if not email or not password:
+        raise RuntimeError(
+            "CCTV_GRID_EMAIL or CCTV_GRID_PASSWORD "
+            "is not configured"
         )
 
-    with open(CATALOGUE_PATH, "r", encoding="utf-8") as file:
-        cameras = json.load(file)
+    # ---------------------------------------------------------
+    # Create cookie-aware HTTP session
+    # ---------------------------------------------------------
 
-    if not isinstance(cameras, list):
-        raise ValueError("Camera catalogue must be a JSON list")
+    cookie_jar = http.cookiejar.CookieJar()
 
-    return cameras
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(cookie_jar)
+    )
+
+    # ---------------------------------------------------------
+    # Open login page first
+    # ---------------------------------------------------------
+
+    login_page_request = urllib.request.Request(
+        LOGIN_URL,
+        method="GET",
+        headers={
+            "User-Agent": "Sentinel-X/1.0",
+            "Accept": "text/html,application/xhtml+xml",
+        },
+    )
+
+    try:
+        with opener.open(
+            login_page_request,
+            timeout=30,
+        ) as response:
+
+            response.read()
+
+            print(
+                "CCTV login page:",
+                response.status,
+                response.geturl(),
+            )
+
+    except Exception as exc:
+        raise RuntimeError(
+            f"CCTV portal login page unavailable: {exc}"
+        ) from exc
+
+    # ---------------------------------------------------------
+    # Submit login form
+    # ---------------------------------------------------------
+
+    login_data = urllib.parse.urlencode(
+        {
+            "email": email,
+            "password": password,
+        }
+    ).encode("utf-8")
+
+    login_request = urllib.request.Request(
+        LOGIN_URL,
+        data=login_data,
+        method="POST",
+        headers={
+            "Content-Type":
+                "application/x-www-form-urlencoded",
+            "User-Agent":
+                "Sentinel-X/1.0",
+            "Accept":
+                "text/html,application/xhtml+xml",
+        },
+    )
+
+    try:
+        with opener.open(
+            login_request,
+            timeout=30,
+        ) as response:
+
+            login_status = response.status
+            login_url = response.geturl()
+            login_body = response.read()
+
+            print(
+                "CCTV login response:",
+                login_status,
+                login_url,
+            )
+
+            print(
+                "CCTV login response bytes:",
+                len(login_body),
+            )
+
+            print(
+                "CCTV cookies:",
+                len(cookie_jar),
+            )
+
+    except Exception as exc:
+        raise RuntimeError(
+            f"CCTV portal login failed: {exc}"
+        ) from exc
+
+    # ---------------------------------------------------------
+    # Fetch catalogue using SAME authenticated session
+    # ---------------------------------------------------------
+
+    catalogue_request = urllib.request.Request(
+        CATALOGUE_URL,
+        method="GET",
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "Sentinel-X/1.0",
+            "Referer": LOGIN_URL,
+            "Connection": "close",
+        },
+    )
+
+    last_error = None
+
+    for attempt in range(1, 4):
+
+        try:
+            print(
+                f"CCTV catalogue request attempt "
+                f"{attempt}/3..."
+            )
+
+            with opener.open(
+                catalogue_request,
+                timeout=45,
+            ) as response:
+
+                body_bytes = response.read()
+
+                status = response.status
+                final_url = response.geturl()
+                content_type = (
+                    response.headers.get(
+                        "Content-Type"
+                    )
+                )
+
+            print(
+                "CCTV catalogue response:",
+                status,
+                final_url,
+            )
+
+            print(
+                "CCTV catalogue content type:",
+                content_type,
+            )
+
+            print(
+                "CCTV catalogue bytes:",
+                len(body_bytes),
+            )
+
+            body = body_bytes.decode(
+                "utf-8",
+                errors="replace",
+            ).strip()
+
+            if not body:
+                raise RuntimeError(
+                    "CCTV catalogue returned an empty response"
+                )
+
+            if body.startswith("<"):
+                preview = body[:200].replace(
+                    "\n",
+                    " ",
+                )
+
+                raise RuntimeError(
+                    "CCTV catalogue returned HTML "
+                    "instead of JSON. "
+                    f"URL: {final_url}. "
+                    f"Preview: {preview}"
+                )
+
+            try:
+                cameras = json.loads(body)
+
+            except json.JSONDecodeError as exc:
+                preview = body[:200].replace(
+                    "\n",
+                    " ",
+                )
+
+                raise RuntimeError(
+                    "CCTV catalogue returned invalid JSON. "
+                    f"Preview: {preview}"
+                ) from exc
+
+            if not isinstance(cameras, list):
+                raise RuntimeError(
+                    "CCTV catalogue JSON is not a list"
+                )
+
+            print(
+                "CCTV catalogue cameras:",
+                len(cameras),
+            )
+
+            # Cache successful result
+            _catalogue_cache = cameras
+            _catalogue_cache_time = time.time()
+
+            return cameras
+
+        except Exception as exc:
+            last_error = exc
+
+            print(
+                f"CCTV catalogue attempt "
+                f"{attempt} failed:",
+                repr(exc),
+            )
+
+            if attempt < 3:
+                time.sleep(2)
+
+    raise RuntimeError(
+        f"CCTV catalogue unavailable after 3 attempts: "
+        f"{last_error}"
+    )
 
 
 @app.get("/api/live-cameras")
-def get_live_cameras():
-    cameras = load_camera_catalogue()
+async def get_live_cameras():
+    try:
+        cameras = load_camera_catalogue()
+        return {"count": len(cameras), "cameras": cameras}
+    except Exception as exc:
+        print("Camera catalogue error:", repr(exc))
+        raise HTTPException(
+            status_code=502,
+            detail=f"Unable to load CCTV camera catalogue: {exc}",
+        )
 
-    return {
-        "count": len(cameras),
-        "cameras": cameras
-    }
 # -------------------------
 # INTEGRATIONS + VMS STATUS
 # -------------------------
@@ -390,18 +648,26 @@ def get_camera(camera_id: int, db: Session = Depends(get_db)):
 def get_watchlist(db: Session = Depends(get_db)):
     return db.scalars(select(Watchlist).order_by(Watchlist.id.desc())).all()
 
-@app.post("/api/cctv/whep")
-async def cctv_whep(request: Request):
+@app.post("/api/cctv/whep/{camera_id}")
+async def cctv_whep(camera_id: str, request: Request):
     load_dotenv()
 
     email = os.getenv("CCTV_EMAIL")
     password = os.getenv("CCTV_PASSWORD")
-    camera_id = os.getenv("CCTV_CAMERA_ID", "cam01")
 
     if not email or not password:
         raise HTTPException(
             status_code=500,
             detail="CCTV credentials are not configured"
+        )
+
+    # Only allow catalogue-style camera IDs.
+    camera_id = camera_id.strip().lower()
+
+    if not camera_id.startswith("cam"):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid camera ID"
         )
 
     sdp_offer = await request.body()
@@ -411,9 +677,6 @@ async def cctv_whep(request: Request):
             status_code=400,
             detail="SDP offer is required"
         )
-
-    encoded_email = quote(email, safe="")
-    encoded_password = quote(password, safe="")
 
     whep_url = (
         f"http://103.250.160.189:8889"
@@ -436,7 +699,11 @@ async def cctv_whep(request: Request):
     )
 
     try:
-        with urllib.request.urlopen(whep_request, timeout=15) as response:
+        with urllib.request.urlopen(
+            whep_request,
+            timeout=15
+        ) as response:
+
             answer = response.read()
             location = response.headers.get("Location")
 
@@ -451,11 +718,20 @@ async def cctv_whep(request: Request):
 
     except urllib.error.HTTPError as exc:
         error_body = exc.read().decode(errors="replace")
+        www_authenticate = exc.headers.get("WWW-Authenticate")
+
+        print("WHEP upstream status:", exc.code)
+        print("WHEP upstream WWW-Authenticate:", www_authenticate)
+        print("WHEP upstream body:", error_body[:500])
 
         raise HTTPException(
             status_code=exc.code,
-            detail=f"WHEP server error: {error_body}"
-        )
+            detail={
+                "upstream_status": exc.code,
+                "www_authenticate": www_authenticate,
+                "body": error_body[:500],
+        },
+    )
 
     except Exception as exc:
         raise HTTPException(

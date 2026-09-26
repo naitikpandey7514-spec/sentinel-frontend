@@ -1,0 +1,14 @@
+# Environment files
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Frontend dependencies
+node_modules/
+
+# Generated CCTV/test files
+Backend/cctv-test.mjpeg
+Backend/storage/videos/
