@@ -12,3 +12,6 @@ node_modules/
 # Generated CCTV/test files
 Backend/cctv-test.mjpeg
 Backend/storage/videos/
+
+# Local FFmpeg runtime
+ffmpeg/
