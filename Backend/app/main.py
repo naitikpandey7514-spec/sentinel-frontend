@@ -1,14 +1,20 @@
 from dotenv import load_dotenv
 import cv2
 import threading
+import numpy as np
 import time
-from fastapi.responses import StreamingResponse
+from app.routers import cameras
+from fastapi.responses import (
+    StreamingResponse,
+    JSONResponse,
+)
+
+from app.services.vehicle_detector import detect_vehicles
 from pathlib import Path
 import base64
 import urllib.error
 import urllib.request
-import http.cookiejar
-import base64
+import http.cookiejar   
 from urllib.parse import quote
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi import HTTPException, Query
@@ -16,21 +22,48 @@ import uuid
 import os
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
-
+from app.auth import (
+    AuthBase,
+    PasswordResetIn,
+    User,
+    Role,
+    AuditLog,
+    LoginIn,
+    UserCreateIn,
+    RoleUpdateIn,
+    UserStatusIn,
+    seed_auth,
+    hash_password,
+    verify_password,
+    create_session,
+    revoke_session,
+    public_user,
+    get_current_user,
+    get_user_permissions,
+    require_permission,
+    write_audit,
+    resolve_user_from_request,
+    AUTH_COOKIE_NAME,
+    SESSION_MAX_AGE,
+    AUTH_COOKIE_SECURE,
+)
 import httpx
-from app.services.vehicle_detector import detect_vehicles
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
 import json
-from pathlib import Path
 from sqlalchemy import (
     create_engine, String, Integer, Float, Boolean,
     DateTime, ForeignKey, select, func
 )
 from sqlalchemy.orm import (
-    DeclarativeBase, Mapped, mapped_column,
-    relationship, Session, sessionmaker
+    DeclarativeBase,
+    Mapped,
+    mapped_column,
+    relationship,
+    Session,
+    sessionmaker,
+    selectinload,
 )
 
 load_dotenv()
@@ -169,7 +202,10 @@ class AlertStatusIn(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
+    AuthBase.metadata.create_all(bind=engine)
 
+    with SessionLocal() as auth_db:
+        seed_auth(auth_db)
     with SessionLocal() as db:
         if db.scalar(select(func.count()).select_from(Camera)) == 0:
             demo_cameras = [
@@ -224,18 +260,72 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+# ============================================================
+# API AUTHENTICATION MIDDLEWARE
+# ============================================================
 
+PUBLIC_API_PATHS = {
+    "/api/health",
+    "/api/auth/login",
+}
+
+
+@app.middleware("http")
+async def api_authentication_middleware(request: Request, call_next):
+    path = request.url.path
+
+    if (
+        path.startswith("/api/")
+        and path not in PUBLIC_API_PATHS
+    ):
+        with SessionLocal() as db:
+            user = resolve_user_from_request(request, db)
+
+            if not user:
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Authentication required"},
+                )
+
+            # Re-load the user inside THIS active session and eagerly
+            # load role + permissions so they remain available after
+            # the session closes.
+            user = db.scalar(
+                select(User)
+                .options(
+                    selectinload(User.role).selectinload(Role.permissions)
+                )
+                .where(User.id == user.id)
+            )
+
+            if not user:
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Authentication required"},
+                )
+
+            permissions = get_user_permissions(user)
+
+            request.state.user = user
+            request.state.permissions = permissions
+
+    return await call_next(request)
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 # Sentinel Camera Grid catalogue
 CATALOGUE_URL = "https://cctv.corp8.cloud/cameras.json"
 
 CATALOGUE_URL = "https://cctv.corp8.cloud/cameras.json"
-
-
-import http.cookiejar
-import urllib.parse
-import urllib.request
-import json
-import os
 
 
 CATALOGUE_URL = "https://cctv.corp8.cloud/cameras.json"
@@ -262,10 +352,13 @@ def load_camera_catalogue():
         < CATALOGUE_CACHE_SECONDS
     ):
         return _catalogue_cache
-
+    
+    load_dotenv(
+        dotenv_path=Path(__file__).resolve().parent.parent / ".env"
+    )
     email = os.getenv("CCTV_GRID_EMAIL")
     password = os.getenv("CCTV_GRID_PASSWORD")
-
+    
     if not email or not password:
         raise RuntimeError(
             "CCTV_GRID_EMAIL or CCTV_GRID_PASSWORD "
@@ -463,11 +556,13 @@ def load_camera_catalogue():
                     f"Preview: {preview}"
                 ) from exc
 
+            if isinstance(cameras, dict):
+                cameras = cameras.get("cameras", [])
+
             if not isinstance(cameras, list):
                 raise RuntimeError(
-                    "CCTV catalogue JSON is not a list"
-                )
-
+                    "CCTV catalogue JSON does not contain a camera list"
+            )
             print(
                 "CCTV catalogue cameras:",
                 len(cameras),
@@ -501,9 +596,31 @@ def load_camera_catalogue():
 async def get_live_cameras():
     try:
         cameras = load_camera_catalogue()
-        return {"count": len(cameras), "cameras": cameras}
+
+        normalized_cameras = []
+
+        for camera in cameras:
+            if not isinstance(camera, dict):
+                continue
+
+            normalized_cameras.append(
+                {
+                    **camera,
+                    "id": camera.get("id"),
+                    "name": camera.get("name"),
+                    "latitude": camera.get("latitude"),
+                    "longitude": camera.get("longitude"),
+                }
+            )
+
+        return {
+            "count": len(normalized_cameras),
+            "cameras": normalized_cameras,
+        }
+
     except Exception as exc:
         print("Camera catalogue error:", repr(exc))
+
         raise HTTPException(
             status_code=502,
             detail=f"Unable to load CCTV camera catalogue: {exc}",
@@ -575,16 +692,7 @@ def get_vms_connections():
             "uptime": None
         }
     ]
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
 
 
 # -------------------------
@@ -599,7 +707,465 @@ def root():
 @app.get("/api/health")
 def health():
     return {"status": "ok", "service": "sentinel-backend"}
+# ============================================================
+# AUTHENTICATION
+# ============================================================
 
+
+@app.post("/api/auth/login")
+def auth_login(
+    payload: LoginIn,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    identifier = payload.identifier.strip()
+
+    user = db.scalar(
+        select(User).where(
+            (User.email == identifier.lower())
+            | (
+                User.username
+                == identifier.lower()
+            )
+        )
+    )
+
+    if not user:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid username or password",
+        )
+
+    if not user.is_active:
+        raise HTTPException(
+            status_code=403,
+            detail="User account is disabled",
+        )
+
+    if not verify_password(
+        payload.password,
+        user.password_hash,
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid username or password",
+        )
+
+    user.last_login_at = now_utc()
+
+    token = create_session(
+        db,
+        user.id,
+    )
+
+    write_audit(
+        db,
+        user.id,
+        "LOGIN",
+        target_type="USER",
+        target_id=str(user.id),
+    )
+
+    db.commit()
+    db.refresh(user)
+
+    response.set_cookie(
+        key=AUTH_COOKIE_NAME,
+        value=token,
+        max_age=SESSION_MAX_AGE,
+        httponly=True,
+        secure=AUTH_COOKIE_SECURE,
+        samesite="lax",
+        path="/",
+    )
+
+    return {
+        "message": "Login successful",
+        "user": public_user(user),
+    }
+
+
+@app.post("/api/auth/logout")
+def auth_logout(
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    current_user = resolve_user_from_request(
+        request,
+        db,
+    )
+
+    raw_token = request.cookies.get(
+        AUTH_COOKIE_NAME
+    )
+
+    if current_user:
+        write_audit(
+            db,
+            current_user.id,
+            "LOGOUT",
+            target_type="USER",
+            target_id=str(
+                current_user.id
+            ),
+        )
+
+    revoke_session(
+        db,
+        raw_token,
+    )
+
+    db.commit()
+
+    response.delete_cookie(
+        key=AUTH_COOKIE_NAME,
+        path="/",
+    )
+
+    return {
+        "message": "Logged out"
+    }
+
+
+@app.get("/api/auth/me")
+def auth_me(
+    current_user: User = Depends(
+        get_current_user
+    ),
+):
+    return {
+        "user": public_user(
+            current_user
+        )
+    }
+
+# ============================================================
+# USER ADMINISTRATION
+# ============================================================
+
+
+@app.get("/api/auth/users")
+def get_users(
+    current_user: User = Depends(
+        require_permission("users.view")
+    ),
+    db: Session = Depends(get_db),
+):
+    users = db.scalars(
+        select(User).order_by(
+            User.id.asc()
+        )
+    ).all()
+
+    return [
+        public_user(user)
+        for user in users
+    ]
+
+
+@app.post("/api/auth/users")
+def create_user(
+    payload: UserCreateIn,
+    current_user: User = Depends(
+        require_permission("users.manage")
+    ),
+    db: Session = Depends(get_db),
+):
+    username = (
+        payload.username
+        .strip()
+        .lower()
+    )
+
+    email = (
+        payload.email
+        .strip()
+        .lower()
+    )
+
+    full_name = payload.full_name.strip()
+
+    role_name = (
+        payload.role
+        .strip()
+        .upper()
+    )
+    role = db.scalar(
+    select(Role).where(Role.name == role_name)
+)
+
+    if not role:
+        raise HTTPException(
+        status_code=400,
+        detail=f"Unknown role: {role_name}",
+    )
+
+    if role_name not in {
+        "SUPER_ADMIN",
+        "SECURITY_ADMIN",
+        "OPERATOR",
+        "VIEWER",
+    }:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid role",
+        )
+
+    existing = db.scalar(
+        select(User).where(
+            (User.username == username)
+            | (User.email == email)
+        )
+    )
+
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Username or email already exists"
+            ),
+        )
+
+    role = db.scalar(
+        select(Role).where(
+            Role.name == role_name
+        )
+    )
+
+    if not role:
+        raise HTTPException(
+            status_code=400,
+            detail="Role not found",
+        )
+
+    user = User(
+    username=payload.username.strip(),
+    email=payload.email.strip().lower(),
+    name=payload.name.strip(),
+    password_hash=hash_password(payload.password),
+    role_id=role.id,
+    is_active=True,
+)
+
+    db.add(user)
+    db.flush()
+
+    write_audit(
+        db,
+        current_user.id,
+        "USER_CREATED",
+        target_type="USER",
+        target_id=str(user.id),
+        details={
+            "username": user.username,
+            "role": role_name,
+        },
+    )
+
+    db.commit()
+    db.refresh(user)
+
+    return {
+        "message": "User created",
+        "user": public_user(user),
+    }
+
+
+@app.patch("/api/auth/users/{user_id}/role")
+def update_user_role(
+    user_id: int,
+    payload: RoleUpdateIn,
+    current_user: User = Depends(
+        require_permission("users.manage")
+    ),
+    db: Session = Depends(get_db),
+):
+    user = db.get(
+        User,
+        user_id,
+    )
+
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found",
+        )
+
+    role_name = (
+        payload.role
+        .strip()
+        .upper()
+    )
+
+    role = db.scalar(
+        select(Role).where(
+            Role.name == role_name
+        )
+    )
+
+    if not role:
+        raise HTTPException(
+            status_code=400,
+            detail="Role not found",
+        )
+
+    old_role = (
+        user.role.name
+        if user.role
+        else None
+    )
+
+    user.role_id = role.id
+
+    write_audit(
+        db,
+        current_user.id,
+        "USER_ROLE_CHANGED",
+        target_type="USER",
+        target_id=str(user.id),
+        details={
+            "old_role": old_role,
+            "new_role": role_name,
+        },
+    )
+
+    db.commit()
+    db.refresh(user)
+
+    return {
+        "message": "User role updated",
+        "user": public_user(user),
+    }
+
+
+@app.patch("/api/auth/users/{user_id}/status")
+def update_user_status(
+    user_id: int,
+    payload: UserStatusIn,
+    current_user: User = Depends(
+        require_permission("users.manage")
+    ),
+    db: Session = Depends(get_db),
+):
+    user = db.get(
+        User,
+        user_id,
+    )
+
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found",
+        )
+
+    if (
+        user.id == current_user.id
+        and not payload.is_active
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "You cannot disable "
+                "your own account"
+            ),
+        )
+
+    user.is_active = payload.is_active
+
+    write_audit(
+        db,
+        current_user.id,
+        "USER_STATUS_CHANGED",
+        target_type="USER",
+        target_id=str(user.id),
+        details={
+            "is_active": payload.is_active,
+        },
+    )
+
+    db.commit()
+    db.refresh(user)
+
+    return {
+        "message": "User status updated",
+        "user": public_user(user),
+    }
+
+
+@app.patch("/api/auth/users/{user_id}/password")
+def reset_user_password(
+    user_id: int,
+    payload: PasswordResetIn,
+    current_user: User = Depends(
+        require_permission("users.manage")
+    ),
+    db: Session = Depends(get_db),
+):
+    user = db.get(
+        User,
+        user_id,
+    )
+
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found",
+        )
+
+    user.password_hash = hash_password(
+        payload.password
+    )
+
+    write_audit(
+        db,
+        current_user.id,
+        "USER_PASSWORD_CHANGED",
+        target_type="USER",
+        target_id=str(user.id),
+    )
+
+    db.commit()
+
+    return {
+        "message": (
+            "User password updated"
+        )
+    }
+
+
+@app.get("/api/auth/audit")
+def get_audit_logs(
+    current_user: User = Depends(
+        require_permission("audit.view")
+    ),
+    db: Session = Depends(get_db),
+):
+    logs = db.scalars(
+        select(AuditLog)
+        .order_by(
+            AuditLog.created_at.desc()
+        )
+        .limit(200)
+    ).all()
+
+    return [
+        {
+            "id": log.id,
+            "actor_user_id":
+                log.actor_user_id,
+            "action": log.action,
+            "target_type":
+                log.target_type,
+            "target_id":
+                log.target_id,
+            "details":
+                log.details,
+            "created_at":
+                log.created_at,
+        }
+        for log in logs
+    ]
 
 @app.get("/api/dashboard")
 def dashboard(db: Session = Depends(get_db)):
@@ -1249,3 +1815,293 @@ def test_cctv_connection():
     finally:
         if cap is not None:
             cap.release()
+# -------------------------
+# CCTV AI PIPELINE
+# -------------------------
+
+_cctv_reader_workers = {}
+_cctv_ai_workers = {}
+
+_cctv_frames = {}
+_cctv_ai_cache = {}
+
+_cctv_frame_lock = threading.Lock()
+_cctv_ai_lock = threading.Lock()
+
+AI_INTERVAL_SECONDS = 0.35
+AI_RESULT_MAX_AGE_SECONDS = 2.5
+
+
+def _build_cctv_rtsp_url(camera_id: str):
+    from urllib.parse import quote
+
+    load_dotenv(
+        dotenv_path=Path(__file__).resolve().parent.parent / ".env"
+    )
+
+    email = os.getenv("CCTV_EMAIL")
+    password = os.getenv("CCTV_PASSWORD")
+
+    if not email or not password:
+        raise RuntimeError(
+            "CCTV configuration is incomplete"
+        )
+
+    safe_email = quote(email, safe="")
+    safe_password = quote(password, safe="")
+
+    return (
+        f"rtsp://{safe_email}:{safe_password}"
+        f"@103.250.160.189:8554/stream/{camera_id}"
+    )
+
+def _cctv_reader_worker(camera_id: str):
+    load_dotenv(
+        dotenv_path=Path(__file__).resolve().parent.parent / ".env"
+    )
+
+    # Keep RTSP transport separate from the browser WHEP path.
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+        "rtsp_transport;tcp|"
+        "fflags;nobuffer|"
+        "flags;low_delay"
+    )
+
+    rtsp_url = _build_cctv_rtsp_url(camera_id)
+
+    cap = None
+
+    try:
+        while True:
+            if cap is None or not cap.isOpened():
+                if cap is not None:
+                    cap.release()
+
+                cap = cv2.VideoCapture(
+                    rtsp_url,
+                    cv2.CAP_FFMPEG
+                )
+
+                if not cap.isOpened():
+                    print(
+                        f"CCTV RTSP reader connection failed: {camera_id}"
+                    )
+                    time.sleep(2)
+                    continue
+
+                cap.set(
+                    cv2.CAP_PROP_BUFFERSIZE,
+                    1
+                )
+
+                print(
+                    f"CCTV RTSP reader connected: {camera_id}"
+                )
+
+            success, frame = cap.read()
+
+            if not success or frame is None:
+                print(
+                    f"CCTV RTSP reader lost frame: {camera_id}"
+                )
+
+                cap.release()
+                cap = None
+
+                time.sleep(1)
+                continue
+
+            # Only retain the newest frame.
+            # Never build an old-frame backlog.
+            with _cctv_frame_lock:
+                _cctv_frames[camera_id] = frame
+
+    except Exception as exc:
+        print(
+            f"CCTV RTSP reader failed for {camera_id}:",
+            repr(exc)
+        )
+
+    finally:
+        if cap is not None:
+            cap.release()
+
+
+def _cctv_ai_worker(camera_id: str):
+    last_inference = 0.0
+
+    try:
+        while True:
+            frame = None
+
+            with _cctv_frame_lock:
+                latest_frame = _cctv_frames.get(camera_id)
+
+                if latest_frame is not None:
+                    frame = latest_frame.copy()
+
+            if frame is None:
+                time.sleep(0.05)
+                continue
+
+            now = time.monotonic()
+
+            if (
+                now - last_inference
+                < AI_INTERVAL_SECONDS
+            ):
+                time.sleep(0.02)
+                continue
+
+            last_inference = now
+
+            vehicles = detect_vehicles(
+                frame,
+                camera_id=camera_id,
+                tracking=True,
+            )
+
+            with _cctv_ai_lock:
+                _cctv_ai_cache[camera_id] = {
+                    "timestamp": time.time(),
+                    "frame_width": int(frame.shape[1]),
+                    "frame_height": int(frame.shape[0]),
+                    "vehicle_count": len(vehicles),
+                    "vehicles": vehicles,
+                }
+
+    except Exception as exc:
+        print(
+            f"CCTV AI worker failed for {camera_id}:",
+            repr(exc)
+        )
+
+
+def _ensure_cctv_ai_worker(camera_id: str):
+    with _cctv_frame_lock:
+        reader = _cctv_reader_workers.get(camera_id)
+
+        if not reader or not reader.is_alive():
+            reader = threading.Thread(
+                target=_cctv_reader_worker,
+                args=(camera_id,),
+                daemon=True,
+                name=f"cctv-reader-{camera_id}",
+            )
+
+            _cctv_reader_workers[camera_id] = reader
+            reader.start()
+
+    with _cctv_ai_lock:
+        ai_worker = _cctv_ai_workers.get(camera_id)
+
+        if not ai_worker or not ai_worker.is_alive():
+            ai_worker = threading.Thread(
+                target=_cctv_ai_worker,
+                args=(camera_id,),
+                daemon=True,
+                name=f"cctv-ai-{camera_id}",
+            )
+
+            _cctv_ai_workers[camera_id] = ai_worker
+            ai_worker.start()
+
+
+@app.get("/api/cctv/detect/{camera_id}")
+def detect_cctv_frame(camera_id: str):
+    _ensure_cctv_ai_worker(camera_id)
+
+    with _cctv_ai_lock:
+        result = _cctv_ai_cache.get(camera_id)
+
+    if not result:
+        raise HTTPException(
+            status_code=503,
+            detail="AI worker warming up"
+        )
+
+    age_seconds = (
+        time.time() - result["timestamp"]
+    )
+
+    if age_seconds > AI_RESULT_MAX_AGE_SECONDS:
+        return {
+            "camera_id": camera_id,
+            "frame_width": result["frame_width"],
+            "frame_height": result["frame_height"],
+            "vehicle_count": 0,
+            "vehicles": [],
+            "timestamp": result["timestamp"],
+            "age_seconds": round(age_seconds, 3),
+            "stale": True,
+        }
+
+    return {
+        "camera_id": camera_id,
+        "frame_width": result["frame_width"],
+        "frame_height": result["frame_height"],
+        "vehicle_count": result["vehicle_count"],
+        "vehicles": result["vehicles"],
+        "timestamp": result["timestamp"],
+        "age_seconds": round(age_seconds, 3),
+        "stale": False,
+    }
+@app.post("/api/cctv/analyze-frame/{camera_id}")
+async def analyze_cctv_frame(
+    camera_id: str,
+    request: Request,
+):
+    try:
+        body = await request.body()
+
+        if not body:
+            raise HTTPException(
+                status_code=400,
+                detail="Empty frame"
+            )
+
+        image_array = np.frombuffer(
+            body,
+            dtype=np.uint8,
+        )
+
+        frame = cv2.imdecode(
+            image_array,
+            cv2.IMREAD_COLOR,
+        )
+
+        if frame is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid image frame"
+            )
+
+        vehicles = detect_vehicles(
+            frame,
+            camera_id=camera_id,
+            tracking=True,
+        )
+
+        return {
+            "camera_id": camera_id,
+            "frame_width": int(frame.shape[1]),
+            "frame_height": int(frame.shape[0]),
+            "vehicle_count": len(vehicles),
+            "vehicles": vehicles,
+            "timestamp": time.time(),
+            "stale": False,
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        print(
+            f"CCTV frame analysis failed for "
+            f"{camera_id}: {exc!r}"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Frame analysis failed",
+        )

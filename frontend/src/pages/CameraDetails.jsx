@@ -21,6 +21,15 @@ function CameraDetails() {
 
   const videoRef = useRef(null);
 
+  const detectionCanvasRef = useRef(null);
+
+  const analysisCanvasRef = useRef(null);
+  const [detections, setDetections] = useState([]);
+  const [detectionFrame, setDetectionFrame] = useState({
+  width: 1920,
+  height: 1080,
+});
+
   const [camera, setCamera] = useState(null);
   const [events, setEvents] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -236,8 +245,9 @@ function CameraDetails() {
         );
 
         const response = await fetch(whepUrl, {
-          method: "POST",
-          headers: {
+  method: "POST",
+  credentials: "include",
+  headers: {
             "Content-Type": "application/sdp",
             Accept: "application/sdp",
           },
@@ -295,6 +305,312 @@ function CameraDetails() {
     };
   }, [cameraId]);
 
+  useEffect(() => {
+  if (!cameraId || !videoRef.current) {
+    return;
+  }
+
+  let stopped = false;
+  let busy = false;
+  let timeoutId = null;
+
+  const video = videoRef.current;
+  const canvas =
+    analysisCanvasRef.current ||
+    document.createElement("canvas");
+
+  async function analyzeCurrentFrame() {
+    if (stopped || busy) {
+      return;
+    }
+
+    if (
+      video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA ||
+      !video.videoWidth ||
+      !video.videoHeight
+    ) {
+      timeoutId = window.setTimeout(
+        analyzeCurrentFrame,
+        250
+      );
+      return;
+    }
+
+    busy = true;
+
+    try {
+      const sourceWidth = video.videoWidth;
+      const sourceHeight = video.videoHeight;
+
+      const maxWidth = 960;
+      const scale = Math.min(
+        1,
+        maxWidth / sourceWidth
+      );
+
+      const width = Math.max(
+        1,
+        Math.round(sourceWidth * scale)
+      );
+
+      const height = Math.max(
+        1,
+        Math.round(sourceHeight * scale)
+      );
+
+      canvas.width = width;
+      canvas.height = height;
+
+      const ctx = canvas.getContext("2d");
+
+      if (!ctx) {
+        return;
+      }
+
+      ctx.drawImage(
+        video,
+        0,
+        0,
+        width,
+        height
+      );
+
+      const blob = await new Promise(
+        (resolve) => {
+          canvas.toBlob(
+            resolve,
+            "image/jpeg",
+            0.65
+          );
+        }
+      );
+
+      if (!blob || stopped) {
+        return;
+      }
+
+      const response = await api.post(
+        `/api/cctv/analyze-frame/${encodeURIComponent(
+          cameraId
+        )}`,
+        blob,
+        {
+          headers: {
+            "Content-Type": "image/jpeg",
+          },
+          timeout: 5000,
+        }
+      );
+
+      if (stopped) {
+        return;
+      }
+
+      setDetections(
+        response.data.vehicles || []
+      );
+
+      setDetectionFrame({
+        width:
+          Number(
+            response.data.frame_width
+          ) || width,
+        height:
+          Number(
+            response.data.frame_height
+          ) || height,
+      });
+    } catch (err) {
+      if (!stopped) {
+        console.error(
+          `WHEP frame AI error for ${cameraId}:`,
+          err
+        );
+      }
+    } finally {
+      busy = false;
+
+      if (!stopped) {
+        timeoutId = window.setTimeout(
+          analyzeCurrentFrame,
+          250
+        );
+      }
+    }
+  }
+
+  analyzeCurrentFrame();
+
+  return () => {
+    stopped = true;
+
+    if (timeoutId) {
+      window.clearTimeout(timeoutId);
+    }
+  };
+}, [cameraId, camera]);
+useEffect(() => {
+  const canvas = detectionCanvasRef.current;
+  const video = videoRef.current;
+
+  if (!canvas || !video) {
+    return;
+  }
+
+  const ctx = canvas.getContext("2d");
+
+  if (!ctx) {
+    return;
+  }
+
+  let animationFrameId = null;
+
+  const resizeCanvas = () => {
+    const rect = video.getBoundingClientRect();
+
+    if (!rect.width || !rect.height) {
+      return;
+    }
+
+    const dpr = window.devicePixelRatio || 1;
+
+    const width = Math.round(rect.width * dpr);
+    const height = Math.round(rect.height * dpr);
+
+    if (
+      canvas.width !== width ||
+      canvas.height !== height
+    ) {
+      canvas.width = width;
+      canvas.height = height;
+    }
+  };
+
+  const drawDetections = () => {
+    const rect = video.getBoundingClientRect();
+
+    if (!rect.width || !rect.height) {
+      animationFrameId = requestAnimationFrame(drawDetections);
+      return;
+    }
+
+    resizeCanvas();
+
+    const dpr = window.devicePixelRatio || 1;
+
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(
+      0,
+      0,
+      rect.width,
+      rect.height
+    );
+
+    const scaleX =
+      rect.width / detectionFrame.width;
+
+    const scaleY =
+      rect.height / detectionFrame.height;
+
+    detections.forEach((detection) => {
+      const [x1, y1, x2, y2] =
+        detection.bbox || [];
+
+      if (
+        !Number.isFinite(x1) ||
+        !Number.isFinite(y1) ||
+        !Number.isFinite(x2) ||
+        !Number.isFinite(y2)
+      ) {
+        return;
+      }
+
+      const left = x1 * scaleX;
+      const top = y1 * scaleY;
+      const width = (x2 - x1) * scaleX;
+      const height = (y2 - y1) * scaleY;
+
+      ctx.strokeStyle = "#22c55e";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(
+        left,
+        top,
+        width,
+        height
+      );
+
+      const confidence =
+        Math.round(
+          Number(detection.confidence || 0) * 100
+        );
+
+      const trackLabel =
+        detection.track_id != null
+          ? ` #${detection.track_id}`
+          : "";
+
+      const label =
+        `${detection.vehicle_type || "vehicle"} ` +
+        `${confidence}%${trackLabel}`;
+
+      ctx.font = "600 12px Arial";
+
+      const textWidth =
+        ctx.measureText(label).width;
+
+      const labelHeight = 20;
+      const labelTop =
+        Math.max(0, top - labelHeight);
+
+      ctx.fillStyle =
+        "rgba(34, 197, 94, 0.92)";
+
+      ctx.fillRect(
+        left,
+        labelTop,
+        textWidth + 10,
+        labelHeight
+      );
+
+      ctx.fillStyle = "#ffffff";
+
+      ctx.fillText(
+        label,
+        left + 5,
+        Math.max(14, labelTop + 14)
+      );
+    });
+
+    animationFrameId =
+      requestAnimationFrame(drawDetections);
+  };
+
+  const resizeObserver =
+    new ResizeObserver(() => {
+      resizeCanvas();
+    });
+
+  resizeObserver.observe(video);
+
+  resizeCanvas();
+  animationFrameId =
+    requestAnimationFrame(drawDetections);
+
+  return () => {
+    resizeObserver.disconnect();
+
+    if (animationFrameId) {
+      cancelAnimationFrame(animationFrameId);
+    }
+
+    ctx.clearRect(
+      0,
+      0,
+      canvas.width,
+      canvas.height
+    );
+  };
+}, [detections, detectionFrame]);
   if (loading) {
     return (
       <div className="page">
@@ -418,15 +734,37 @@ function CameraDetails() {
             </button>
           </div>
 
-          <div className="camera-stream">
-            <video
-              ref={videoRef}
-              autoPlay
-              muted
-              playsInline
-              className="camera-live-feed"
-            />
-          </div>
+          <div
+  className="camera-stream"
+  style={{ position: "relative" }}
+>
+  <video
+  ref={videoRef}
+  autoPlay
+  muted
+  playsInline
+  className="camera-live-feed"
+  style={{
+    position: "relative",
+    zIndex: 1,
+    display: "block",
+  }}
+/>
+
+<canvas
+  ref={detectionCanvasRef}
+  className="camera-detection-overlay"
+  style={{
+    position: "absolute",
+    inset: 0,
+    width: "100%",
+    height: "100%",
+    zIndex: 20,
+    pointerEvents: "none",
+    display: "block",
+  }}
+/>
+</div>
         </section>
 
         <section className="camera-health-panel">

@@ -73,10 +73,9 @@ export function normalizeCameras(data) {
       uptime: "N/A",
       detection: "Not Connected",
 
-      latitude: 23.0225,
-      longitude: 72.5714,
-
-      hls: `https://cctv.corp8.cloud/${id}/index.m3u8`,
+      latitude: camera.latitude ?? null,
+      longitude: camera.longitude ?? null,
+      hls: camera.hls ?? null,  
 
       whep: `http://103.250.160.189:8889/stream/${id}/whep`,
     };

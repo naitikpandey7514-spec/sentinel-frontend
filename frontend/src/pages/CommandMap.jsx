@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Camera,
   MapPin,
@@ -7,11 +7,37 @@ import {
   WifiOff,
 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
+import L from "leaflet";
 
 import api from "../services/api";
 
+import "leaflet/dist/leaflet.css";
+function hasCoordinates(camera) {
+  const latitude = camera?.latitude;
+  const longitude = camera?.longitude;
+
+  if (
+    latitude === null ||
+    latitude === undefined ||
+    latitude === "" ||
+    longitude === null ||
+    longitude === undefined ||
+    longitude === ""
+  ) {
+    return false;
+  }
+
+  return (
+    Number.isFinite(Number(latitude)) &&
+    Number.isFinite(Number(longitude))
+  );
+}
 function CommandMap() {
   const navigate = useNavigate();
+
+  const mapRef = useRef(null);
+  const mapInstanceRef = useRef(null);
+  const markersLayerRef = useRef(null);
 
   const [cameras, setCameras] = useState([]);
   const [selectedCamera, setSelectedCamera] = useState(null);
@@ -23,16 +49,16 @@ function CommandMap() {
     setError("");
 
     try {
-      const response = await api.get("/api/cameras");
+      const response = await api.get("/api/live-cameras");
 
       const data = Array.isArray(response.data)
         ? response.data
-        : response.data.cameras || [];
+        : response.data?.cameras || [];
 
       setCameras(data);
 
       if (data.length > 0) {
-        setSelectedCamera(data[0]);
+        setSelectedCamera((current) => current || data[0]);
       }
     } catch (err) {
       console.error("Map camera API error:", err);
@@ -46,9 +72,197 @@ function CommandMap() {
     }
   }
 
+    useEffect(() => {
+      loadCameras();
+    }, []);
+
+    useEffect(() => {
+  if (!mapRef.current || mapInstanceRef.current) {
+    return;
+  }
+
+  const map = L.map(mapRef.current, {
+  center: [22.2587, 71.1924],
+  zoom: 7,
+  minZoom: 5,
+  maxZoom: 19,
+  zoomControl: true,
+});
+
+    L.tileLayer(
+  "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+  {
+    attribution:
+      '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+    minZoom: 0,
+    maxZoom: 19,
+    maxNativeZoom: 19,
+  }
+).addTo(map);
+
+    markersLayerRef.current = L.layerGroup().addTo(map);
+    mapInstanceRef.current = map;
+
+    requestAnimationFrame(() => {
+  requestAnimationFrame(() => {
+    map.invalidateSize(true);
+  });
+});
+
+    return () => {
+      map.remove();
+      mapInstanceRef.current = null;
+      markersLayerRef.current = null;
+    };
+  }, [loading]);
+
   useEffect(() => {
-    loadCameras();
-  }, []);
+    const map = mapInstanceRef.current;
+    const layer = markersLayerRef.current;
+
+    if (!map || !layer) {
+      return;
+    }
+
+    layer.clearLayers();
+
+    const validCameras = cameras.filter(hasCoordinates);
+
+    validCameras.forEach((camera) => {
+      const latitude = Number(camera.latitude);
+      const longitude = Number(camera.longitude);
+
+      if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+        return;
+      }
+
+      const status = String(
+        camera.status || "Unknown"
+      ).toLowerCase();
+
+      const isOnline =
+        status === "online" ||
+        status === "connected" ||
+        status === "active" ||
+        status === "healthy" ||
+        status === "unknown";
+
+      const color = isOnline ? "#16a34a" : "#dc2626";
+
+      const icon = L.divIcon({
+        className: "sentinel-camera-marker",
+        html: `
+          <div style="
+            width:34px;
+            height:34px;
+            border-radius:50%;
+            background:${color};
+            border:3px solid white;
+            box-shadow:0 2px 10px rgba(0,0,0,.45);
+            display:flex;
+            align-items:center;
+            justify-content:center;
+            color:white;
+            font-size:11px;
+            font-weight:700;
+          ">
+            ${camera.id || "CAM"}
+          </div>
+        `,
+        iconSize: [34, 34],
+        iconAnchor: [17, 17],
+      });
+
+      const marker = L.marker(
+        [latitude, longitude],
+        { icon }
+      );
+
+      marker.bindPopup(`
+        <div style="min-width:200px">
+          <strong>${camera.name || camera.id}</strong>
+          <br />
+          <strong>ID:</strong> ${camera.id}
+          <br />
+          <strong>Status:</strong> ${camera.status || "Unknown"}
+          <br />
+          <strong>Location:</strong> ${
+            camera.location || "Unknown"
+          }
+        </div>
+      `);
+
+      marker.on("click", () => {
+        setSelectedCamera(camera);
+      });
+
+      marker.addTo(layer);
+    });
+
+    if (validCameras.length > 0) {
+      const bounds = L.latLngBounds(
+        validCameras.map((camera) => [
+          Number(camera.latitude),
+          Number(camera.longitude),
+        ])
+      );
+
+      map.fitBounds(bounds, {
+        padding: [40, 40],
+        maxZoom: 14,
+      });
+    }
+  }, [cameras]);
+
+  function selectCamera(camera) {
+    setSelectedCamera(camera);
+
+    const map = mapInstanceRef.current;
+
+    if (!map) {
+      return;
+    }
+
+    const latitude = Number(camera.latitude);
+    const longitude = Number(camera.longitude);
+
+    if (
+      Number.isFinite(latitude) &&
+      Number.isFinite(longitude)
+    ) {
+      map.flyTo(
+        [latitude, longitude],
+        16,
+        { duration: 0.8 }
+      );
+    }
+  }
+
+  function showAllCameras() {
+    const map = mapInstanceRef.current;
+
+    if (!map) {
+      return;
+    }
+
+    const validCameras = cameras.filter(hasCoordinates);
+
+    if (!validCameras.length) {
+      return;
+    }
+
+    const bounds = L.latLngBounds(
+      validCameras.map((camera) => [
+        Number(camera.latitude),
+        Number(camera.longitude),
+      ])
+    );
+
+    map.fitBounds(bounds, {
+      padding: [40, 40],
+      maxZoom: 14,
+    });
+  }
 
   return (
     <div className="page command-map-page">
@@ -60,7 +274,7 @@ function CommandMap() {
           </div>
 
           <p>
-            Monitor camera locations and current camera status.
+            Monitor the Sentinel-X camera network geographically.
           </p>
         </div>
 
@@ -90,7 +304,10 @@ function CommandMap() {
 
       {loading ? (
         <div className="loading-screen">
-          <RefreshCw className="spin" size={28} />
+          <RefreshCw
+            className="spin"
+            size={28}
+          />
           <p>Loading camera locations...</p>
         </div>
       ) : cameras.length === 0 ? (
@@ -110,106 +327,54 @@ function CommandMap() {
             <div className="map-header">
               <div>
                 <strong>Sentinel CCTV Network</strong>
+
                 <span>
                   {cameras.length} registered cameras
                 </span>
               </div>
 
-              <div className="map-status">
-                <span className="online-dot"></span>
-                Live Registry
+              <div className="map-actions">
+                <button
+                  className="map-action-button"
+                  onClick={showAllCameras}
+                >
+                  <MapPin size={15} />
+                  Show All
+                </button>
+
+                <div className="map-status">
+                  <span className="online-dot" />
+                  Live Registry
+                </div>
               </div>
             </div>
 
-            <div className="map-area">
-              <div className="map-grid"></div>
-
-              <div className="map-center-label">
-                <MapPin size={24} />
-                <strong>Camera Network</strong>
-                <span>
-                  Geographic map will use real coordinates
-                  supplied by the backend.
-                </span>
-              </div>
-
-              {cameras.map((camera, index) => {
-                const isOnline =
-                  String(camera.status || "")
-                    .toLowerCase() === "online";
-
-                const latitude = Number(
-                  camera.latitude
-                );
-
-                const longitude = Number(
-                  camera.longitude
-                );
-
-                /*
-                  The marker is displayed only when the
-                  backend supplies valid coordinates.
-                */
-                if (
-                  !Number.isFinite(latitude) ||
-                  !Number.isFinite(longitude)
-                ) {
-                  return null;
-                }
-
-                const left =
-                  ((longitude + 180) / 360) * 100;
-
-                const top =
-                  ((90 - latitude) / 180) * 100;
-
-                return (
-                  <button
-                    key={camera.id || index}
-                    className={
-                      isOnline
-                        ? "map-marker online"
-                        : "map-marker offline"
-                    }
-                    style={{
-                      left: `${Math.max(
-                        5,
-                        Math.min(95, left)
-                      )}%`,
-                      top: `${Math.max(
-                        8,
-                        Math.min(92, top)
-                      )}%`,
-                    }}
-                    title={
-                      camera.name || camera.id
-                    }
-                    onClick={() =>
-                      setSelectedCamera(camera)
-                    }
-                  >
-                    <Camera size={15} />
-                  </button>
-                );
-              })}
-            </div>
+            <div
+              ref={mapRef}
+              className="map-area leaflet-map"
+            />
           </section>
 
           <aside className="map-sidebar">
             <div className="map-sidebar-header">
               <div>
                 <h3>Camera List</h3>
-                <p>
-                  {cameras.length} cameras
-                </p>
+                <p>{cameras.length} cameras</p>
               </div>
             </div>
 
             <div className="map-camera-list">
               {cameras.map((camera) => {
+                const status = String(
+                  camera.status || "Unknown"
+                ).toLowerCase();
+
                 const isOnline =
-                  String(camera.status || "")
-                    .toLowerCase() === "online";
+                  status === "online" ||
+                  status === "connected" ||
+                  status === "active" ||
+                  status === "healthy" ||
+                  status === "unknown";
 
                 const selected =
                   selectedCamera?.id === camera.id;
@@ -223,7 +388,7 @@ function CommandMap() {
                         : "map-camera-item"
                     }
                     onClick={() =>
-                      setSelectedCamera(camera)
+                      selectCamera(camera)
                     }
                   >
                     <div className="map-camera-icon">
@@ -247,7 +412,7 @@ function CommandMap() {
                           ? "camera-status-dot online"
                           : "camera-status-dot offline"
                       }
-                    ></span>
+                    />
                   </button>
                 );
               })}
@@ -258,19 +423,14 @@ function CommandMap() {
                 <div className="selected-camera-title">
                   <div>
                     <span>Selected Camera</span>
+
                     <h3>
                       {selectedCamera.name ||
                         selectedCamera.id}
                     </h3>
                   </div>
 
-                  {String(
-                    selectedCamera.status || ""
-                  ).toLowerCase() === "online" ? (
-                    <Wifi size={19} />
-                  ) : (
-                    <WifiOff size={19} />
-                  )}
+                  <Wifi size={19} />
                 </div>
 
                 <div className="selected-details">
@@ -294,6 +454,14 @@ function CommandMap() {
                     <strong>
                       {selectedCamera.location ||
                         "—"}
+                    </strong>
+                  </div>
+
+                  <div>
+                    <span>Coordinates</span>
+                    <strong>
+                      {selectedCamera.latitude},{" "}
+                      {selectedCamera.longitude}
                     </strong>
                   </div>
                 </div>

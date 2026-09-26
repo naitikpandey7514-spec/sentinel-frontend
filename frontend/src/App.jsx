@@ -1,4 +1,11 @@
-import { BrowserRouter, Routes, Route } from "react-router-dom";
+import {
+  BrowserRouter,
+  Routes,
+  Route,
+} from "react-router-dom";
+
+import { AuthProvider } from "./auth/AuthContext";
+import ProtectedRoute from "./auth/ProtectedRoute";
 
 import Layout from "./components/layouts/Layout";
 
@@ -9,32 +16,118 @@ import CommandMap from "./pages/CommandMap";
 import Events from "./pages/Events";
 import IntegrationHub from "./pages/IntegrationHub";
 import VMSConnections from "./pages/VMSConnections";
+import Login from "./pages/Login";
+import UserManagement from "./pages/UserManagement";
 
 import "./App.css";
+
+function SecurePage({
+  children,
+  permission,
+}) {
+  return (
+    <ProtectedRoute
+      permission={permission}
+    >
+      <Layout>
+        {children}
+      </Layout>
+    </ProtectedRoute>
+  );
+}
 
 function App() {
   return (
     <BrowserRouter>
-      <Layout>
+      <AuthProvider>
         <Routes>
-          <Route path="/" element={<Dashboard />} />
-          <Route path="/cameras" element={<Cameras />} />
+          <Route
+            path="/login"
+            element={<Login />}
+          />
+
+          <Route
+            path="/"
+            element={
+              <SecurePage permission="dashboard.view">
+                <Dashboard />
+              </SecurePage>
+            }
+          />
+
+          <Route
+            path="/cameras"
+            element={
+              <SecurePage permission="cameras.view">
+                <Cameras />
+              </SecurePage>
+            }
+          />
+
           <Route
             path="/cameras/:cameraId"
-            element={<CameraDetails />}
+            element={
+              <SecurePage permission="cameras.view">
+                <CameraDetails />
+              </SecurePage>
+            }
           />
-          <Route path="/map" element={<CommandMap />} />
-          <Route path="/events" element={<Events />} />
+
+          <Route
+            path="/map"
+            element={
+              <SecurePage permission="cameras.view">
+                <CommandMap />
+              </SecurePage>
+            }
+          />
+
+          <Route
+            path="/events"
+            element={
+              <SecurePage permission="alerts.view">
+                <Events />
+              </SecurePage>
+            }
+          />
+
           <Route
             path="/integrations"
-            element={<IntegrationHub />}
+            element={
+              <SecurePage permission="integrations.view">
+                <IntegrationHub />
+              </SecurePage>
+            }
           />
+
           <Route
             path="/vms"
-            element={<VMSConnections />}
+            element={
+              <SecurePage permission="integrations.view">
+                <VMSConnections />
+              </SecurePage>
+            }
+          />
+
+          <Route
+            path="/settings/users"
+            element={
+              <SecurePage permission="users.view">
+                <UserManagement />
+              </SecurePage>
+            }
+          />
+
+          <Route
+            path="*"
+            element={
+              <SecurePage permission="dashboard.view">
+                <Dashboard />
+              </SecurePage>
+            }
           />
         </Routes>
-      </Layout>
+      </AuthProvider>
     </BrowserRouter>
   );
 }

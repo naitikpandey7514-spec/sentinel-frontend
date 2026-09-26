@@ -1,4 +1,5 @@
 import { NavLink } from "react-router-dom";
+import { useAuth } from "../../auth/AuthContext";
 import {
   LayoutDashboard,
   Camera,
@@ -10,13 +11,51 @@ import {
 } from "lucide-react";
 
 function Sidebar() {
+  const { hasPermission } = useAuth();
+
   const menu = [
-    { name: "Dashboard", path: "/", icon: LayoutDashboard },
-    { name: "Camera Registry", path: "/cameras", icon: Camera },
-    { name: "Command Map", path: "/map", icon: Map },
-    { name: "Event Stream", path: "/events", icon: Activity },
-    { name: "Integration Hub", path: "/integrations", icon: Plug },
-    { name: "VMS Connections", path: "/vms", icon: Server },
+    {
+      name: "Dashboard",
+      path: "/",
+      icon: LayoutDashboard,
+      permission: "dashboard.view",
+    },
+    {
+      name: "Camera Registry",
+      path: "/cameras",
+      icon: Camera,
+      permission: "cameras.view",
+    },
+    {
+      name: "Command Map",
+      path: "/map",
+      icon: Map,
+      permission: "cameras.view",
+    },
+    {
+      name: "Event Stream",
+      path: "/events",
+      icon: Activity,
+      permission: "alerts.view",
+    },
+    {
+      name: "Integration Hub",
+      path: "/integrations",
+      icon: Plug,
+      permission: "integrations.view",
+    },
+    {
+      name: "VMS Connections",
+      path: "/vms",
+      icon: Server,
+      permission: "integrations.view",
+    },
+    {
+      name: "Access Control",
+      path: "/settings/users",
+      icon: Shield,
+      permission: "users.view",
+    },
   ];
 
   return (
@@ -33,23 +72,33 @@ function Sidebar() {
       </div>
 
       <nav className="sidebar-nav">
-        {menu.map((item) => {
-          const Icon = item.icon;
+        {menu
+          .filter((item) => {
+            if (!item.permission) {
+              return true;
+            }
 
-          return (
-            <NavLink
-              key={item.path}
-              to={item.path}
-              end={item.path === "/"}
-              className={({ isActive }) =>
-                isActive ? "nav-item active" : "nav-item"
-              }
-            >
-              <Icon size={19} />
-              <span>{item.name}</span>
-            </NavLink>
-          );
-        })}
+            return hasPermission(item.permission);
+          })
+          .map((item) => {
+            const Icon = item.icon;
+
+            return (
+              <NavLink
+                key={item.path}
+                to={item.path}
+                end={item.path === "/"}
+                className={({ isActive }) =>
+                  isActive
+                    ? "nav-item active"
+                    : "nav-item"
+                }
+              >
+                <Icon size={19} />
+                <span>{item.name}</span>
+              </NavLink>
+            );
+          })}
       </nav>
 
       <div className="sidebar-footer">
