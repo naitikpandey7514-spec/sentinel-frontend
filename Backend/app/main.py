@@ -7,6 +7,7 @@ from app.routers import cameras
 from fastapi.responses import (
     StreamingResponse,
     JSONResponse,
+    FileResponse,
 )
 
 from app.services.vehicle_detector import detect_vehicles
@@ -2104,4 +2105,256 @@ async def analyze_cctv_frame(
         raise HTTPException(
             status_code=500,
             detail="Frame analysis failed",
+        )
+@app.post("/api/cctv/analyze-region/{camera_id}")
+async def analyze_cctv_region(
+    camera_id: str,
+    request: Request,
+    x: int = Query(default=0, ge=0),
+    y: int = Query(default=0, ge=0),
+    width: int = Query(default=1, gt=0),
+    height: int = Query(default=1, gt=0),
+    features: str = Query(default="color"),
+    timestamp: float | None = Query(default=None),
+    meters_per_pixel: float | None = Query(default=None, gt=0),
+    source: str = Query(default="live"),
+    session_id: str | None = Query(default=None),
+):
+    try:
+        body = await request.body()
+
+        if not body:
+            raise HTTPException(
+                status_code=400,
+                detail="Empty frame",
+            )
+
+        image_array = np.frombuffer(
+            body,
+            dtype=np.uint8,
+        )
+
+        frame = cv2.imdecode(
+            image_array,
+            cv2.IMREAD_COLOR,
+        )
+
+        if frame is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid image frame",
+            )
+
+        requested_features = {
+            item.strip().lower()
+            for item in features.split(",")
+            if item.strip()
+        }
+
+        allowed_features = {
+            "color",
+            "plate",
+            "speed",
+        }
+
+        unknown_features = (
+            requested_features - allowed_features
+        )
+
+        if unknown_features:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "Unsupported analysis feature",
+                    "unsupported": sorted(unknown_features),
+                    "allowed": sorted(allowed_features),
+                },
+            )
+
+        if not requested_features:
+            raise HTTPException(
+                status_code=400,
+                detail="At least one analysis feature is required",
+            )
+
+        from app.services.segment_analyzer import analyze_region
+
+        result = analyze_region(
+            frame=frame,
+            camera_id=camera_id,
+            roi={
+                "x": x,
+                "y": y,
+                "width": width,
+                "height": height,
+            },
+            features=requested_features,
+            timestamp=timestamp,
+            meters_per_pixel=meters_per_pixel,
+            source=source,
+            session_id=session_id,
+            record=True,
+        )
+
+        return result
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        import traceback
+        print(f"CCTV region analysis failed for {camera_id}: {type(exc).__name__}: {exc}")
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Region analysis failed: {type(exc).__name__}: {exc}",
+        )
+
+@app.get("/api/cctv/segment-analysis/{camera_id}")
+def get_segment_analysis(
+    camera_id: str,
+    session_id: str | None = Query(default=None),
+    source: str | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=1000),
+):
+    from app.services.segment_analyzer import (
+        list_analysis_records,
+    )
+
+    return {
+        "camera_id": camera_id,
+        "source": source,
+        "session_id": session_id,
+        "records": list_analysis_records(
+            camera_id=camera_id,
+            session_id=session_id,
+            source=source,
+            limit=limit,
+        ),
+    }
+
+
+@app.get("/api/cctv/segment-evidence/{evidence_id}")
+def get_segment_evidence(
+    evidence_id: str,
+):
+    from app.services.segment_analyzer import (
+        _EVIDENCE_DIR,
+    )
+
+    matches = list(
+        _EVIDENCE_DIR.glob(
+            f"*_{evidence_id[:8]}.jpg"
+        )
+    )
+
+    if not matches:
+        raise HTTPException(
+            status_code=404,
+            detail="Evidence image not found",
+        )
+
+    return FileResponse(
+        path=matches[0],
+        media_type="image/jpeg",
+        filename=matches[0].name,
+    )
+
+
+@app.post("/api/cctv/save-segment-evidence/{camera_id}")
+async def save_segment_evidence(
+    camera_id: str,
+    request: Request,
+):
+    try:
+        body = await request.body()
+
+        if not body:
+            raise HTTPException(
+                status_code=400,
+                detail="Empty evidence image",
+            )
+
+        metadata_header = request.headers.get(
+            "x-segment-metadata"
+        )
+
+        if not metadata_header:
+            raise HTTPException(
+                status_code=400,
+                detail="Missing segment metadata",
+            )
+
+        try:
+            metadata = json.loads(
+                metadata_header
+            )
+        except json.JSONDecodeError:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid segment metadata",
+            )
+
+        source = str(
+            metadata.get(
+                "source",
+                "live",
+            )
+        )
+
+        timestamp = float(
+            metadata.get(
+                "timestamp",
+                time.time(),
+            )
+        )
+
+        roi = metadata.get(
+            "roi",
+            {},
+        )
+
+        features = metadata.get(
+            "features",
+            [],
+        )
+
+        vehicles = metadata.get(
+            "vehicles",
+            [],
+        )
+
+        session_id = metadata.get(
+            "session_id"
+        )
+
+        from app.services.segment_analyzer import (
+            save_evidence,
+        )
+
+        result = save_evidence(
+            camera_id=camera_id,
+            source=source,
+            timestamp=timestamp,
+            roi=roi,
+            features=set(features),
+            vehicles=vehicles,
+            image_bytes=body,
+            session_id=session_id,
+        )
+
+        return result
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        print(
+            f"Segment evidence save failed for "
+            f"{camera_id}: {exc!r}"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Could not save segment evidence",
         )

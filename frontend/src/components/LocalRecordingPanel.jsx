@@ -1,4 +1,5 @@
-import api from "../services/api";
+﻿import api from "../services/api";
+import SegmentAI from "./SegmentAI";
 import {
   Circle,
   Eye,
@@ -1815,8 +1816,15 @@ function LocalRecordingPanel({
         )}
       </div>
       )}
+      <SegmentAI
+        videoRef={videoRef}
+        playbackVideoRef={playbackVideoRef}
+        reviewMode={reviewMode}
+        cameraId={cameraId}
+      />
     </div>
   );
 }
 
 export default LocalRecordingPanel;
+
